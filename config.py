@@ -291,8 +291,9 @@ def _registry_row(device: Dict[str, Any]) -> Dict[str, Any]:
         row['endpoint'] = 'tailcat'
     else:
         row.setdefault('endpoint', 'lan')
-    row.setdefault('device_id', str(row.get('id', '')).rsplit(':', 1)[0])
-    row.setdefault('id', f"{row['device_id']}:{row['endpoint']}")
+    base_id = str(row.get('device_id') or row.get('id', '')).rsplit(':', 1)[0]
+    row['device_id'] = base_id
+    row['id'] = f"{base_id}:{row['endpoint']}"
     row.setdefault('alias', 'Kindle')
     row.setdefault('port', 22)
     row.setdefault('username', 'root')
@@ -314,6 +315,11 @@ def save_devices(devices: List[Dict[str, Any]], active_id: Optional[str] = None,
         rows = [_registry_row(device) for device in public]
         if active_id is None:
             active_id = get_active_device_id()
+        active_base = active_id.rsplit(':', 1)[0] if active_id else ''
+        for r in rows:
+            if r['device_id'] == active_base:
+                active_id = r['id']
+                break
         result = _broker.sync_devices(rows, active_id or '', revision=revision)
         if not isinstance(result, dict):
             raise RuntimeError('kindle-link returned an invalid save response.')

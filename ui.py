@@ -249,6 +249,12 @@ class ManageConnectionsDialog(QDialog):
             dev["endpoint"] = "tailcat"
         elif not dev.get("endpoint") or dev.get("endpoint") == "tailcat":
             dev["endpoint"] = "lan"
+        base_id = str(dev.get("device_id") or dev.get("id", "").split(":")[0])
+        dev["device_id"] = base_id
+        old_id = dev.get("id")
+        dev["id"] = f"{base_id}:{dev['endpoint']}"
+        if self.active_id == old_id:
+            self.active_id = dev["id"]
         is_tc = dev.get("endpoint") == "tailcat" or is_tailcat_address(dev["host"])
         self.btn_tailcat.setVisible(not is_tc)
         self.btn_tailcat_help.setVisible(not is_tc)
