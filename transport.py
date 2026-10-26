@@ -15,13 +15,14 @@ import re
 import shlex
 import shutil
 import signal
-import socket
 import stat as stat_module
 import subprocess
 import tempfile
 import uuid
 from dataclasses import dataclass
 from typing import Any, BinaryIO, Callable, Dict, List, Optional, Sequence, Tuple, Union
+
+from calibre_plugins.kindle_sftp.broker import acquire
 
 
 class TransportError(Exception):
@@ -107,6 +108,7 @@ class SSHTransport:
         self._runtime_dir: Optional[str] = None
         self._control_path: Optional[str] = None
         self._connected = False
+        self._lease = None
 
     @staticmethod
     def _positive_int(value: Any, name: str) -> int:
@@ -189,35 +191,11 @@ class SSHTransport:
         if self._runtime_dir is not None:
             return
         try:
-            # OpenSSH control sockets have a short AF_UNIX path limit.  Keep
-            # the private runtime directory directly under /tmp rather than
-            # inheriting Calibre's potentially deep temporary-directory path.
+            # Per-client transfer staging only; the Rust broker owns SSH sockets.
             self._runtime_dir = tempfile.mkdtemp(prefix="cks-", dir="/tmp")
         except OSError:
             self._runtime_dir = tempfile.mkdtemp(prefix="cks-")
         os.chmod(self._runtime_dir, 0o700)
-        self._control_path = os.path.join(self._runtime_dir, "m.sock")
-
-    def _askpass_environment(self) -> Dict[str, str]:
-        env = os.environ.copy()
-        if not self.password:
-            env["SSH_ASKPASS_REQUIRE"] = "never"
-            env.pop("SSH_ASKPASS", None)
-            env.pop("CALIBRE_SFTP_PASSWORD", None)
-            return env
-        self._ensure_runtime()
-        askpass = os.path.join(self._runtime_dir or "", "askpass.sh")
-        if not os.path.exists(askpass):
-            with open(askpass, "w", encoding="utf-8") as stream:
-                stream.write("#!/bin/sh\nprintf '%s\\n' \"$CALIBRE_SFTP_PASSWORD\"\n")
-            os.chmod(askpass, 0o700)
-        env["SSH_ASKPASS"] = askpass
-        env["SSH_ASKPASS_REQUIRE"] = "force"
-        env["CALIBRE_SFTP_PASSWORD"] = self.password
-        # OpenSSH requires DISPLAY to be set before invoking askpass on some
-        # versions, even with SSH_ASKPASS_REQUIRE=force.
-        env.setdefault("DISPLAY", "calibre-ssh-askpass")
-        return env
 
     @staticmethod
     def _decode(data: bytes) -> str:
@@ -285,32 +263,12 @@ class SSHTransport:
             args += ["-S", self._control_path]
         else:
             args += ["-o", f"ControlPath={self._control_path}", "-o", "ControlMaster=no"]
+        args += ["-o", "ProxyCommand=false"]
         if self.identity_file:
             if not os.path.isfile(self.identity_file):
                 raise TransportAuthenticationError(f"identity file does not exist: {self.identity_file}")
             args += ["-i", self.identity_file]
-        if is_tailcat_address(self.host):
-            tailcat_bin = find_host_tailcat()
-            if not tailcat_bin:
-                raise TransportConnectionError(
-                    "Tailcat host address detected, but the 'tailcat' binary was not found on your system.\n"
-                    "Please install tailcat (e.g. 'go install github.com/tailscale/tailcat/cmd/tailcat@latest') "
-                    "or place it in PATH or ~/go/bin/tailcat."
-                )
-            args += ["-o", f"ProxyCommand='{tailcat_bin}' '{self.host}' '{self.port}' 2>/dev/null"]
         return args
-
-    def _auth_args(self, *, password_prompt: bool) -> List[str]:
-        if password_prompt:
-            return [
-                "-o",
-                "PasswordAuthentication=yes",
-                "-o",
-                "KbdInteractiveAuthentication=yes",
-                "-o",
-                "PreferredAuthentications=publickey,password,keyboard-interactive",
-            ]
-        return ["-o", "BatchMode=yes", "-o", "PreferredAuthentications=publickey"]
 
     def _process_failure(self, result: _Completed, operation: str) -> TransportError:
         detail = self._decode(result.stderr) or self._decode(result.stdout) or "no diagnostic output"
@@ -320,7 +278,7 @@ class SSHTransport:
         if (
             "host key" in lower
             and any(token in lower for token in ("known", "verify", "offending"))
-        ) or "host key verification failed" in lower or "man-in-the-middle" in lower:
+        ) or "host key verification failed" in lower or "man-in-the-middle" in lower or "incompatible connection parameters" in lower:
             return TransportSecurityError(
                 f"{operation} rejected the host key; verify {self.known_hosts} contains the expected key: {detail}"
             )
@@ -333,24 +291,23 @@ class SSHTransport:
     def connect(self) -> None:
         if self._connected and self.is_alive():
             return
-        if self._runtime_dir is not None:
-            self.close()
-        self._ensure_runtime()
-        args = [self.ssh_executable]
-        args += self._common_args(control=True)
-        args += ["-M", "-N", "-f"]
-        args += self._auth_args(password_prompt=bool(self.password))
-        args += ["-o", "ControlMaster=yes", self._destination]
-        result = self._run_process(args, timeout=self.timeout, env=self._askpass_environment())
-        if result.returncode:
-            error = self._process_failure(result, "SSH connection")
-            self.close()
-            raise error
+        self.close()
+        options = {
+            **self._options, 'host': self.host, 'port': self.port,
+            'username': self.username, 'identity_file': self.identity_file,
+            'known_hosts': self.known_hosts, 'ssh_executable': self.ssh_executable,
+            'sftp_executable': self.sftp_executable,
+        }
+        try:
+            self._lease = acquire(options)
+        except Exception as error:
+            raise self._process_failure(
+                _Completed(1, b"", str(error).encode()), "Shared SSH connection",
+            ) from error
+        self._control_path = self._lease.control_path
         self._connected = True
         try:
             self._check_root()
-            # A successful SSH shell connection is not sufficient: ensure the
-            # server exposes the SFTP subsystem before the driver proceeds.
             self._sftp_batch(["pwd"], timeout=self.timeout)
         except Exception:
             self.close()
@@ -362,20 +319,19 @@ class SSHTransport:
         args = [self.ssh_executable]
         args += self._common_args(control=True)
         args += ["-O", operation, self._destination]
-        return self._run_process(args, timeout=self.timeout, env=self._askpass_environment())
+        return self._run_process(args, timeout=self.timeout)
 
     def is_alive(self) -> bool:
-        if not self._connected or self._control_path is None:
+        if not self._connected or self._control_path is None or self._lease is None or not self._lease.is_alive():
             return False
         result = self._control_operation("check")
         return result.returncode == 0
 
     def close(self) -> None:
         self._connected = False
-        try:
-            self._control_operation("exit")
-        except Exception:
-            pass
+        lease, self._lease = self._lease, None
+        if lease is not None:
+            lease.close()
         runtime = self._runtime_dir
         self._control_path = None
         self._runtime_dir = None
@@ -414,9 +370,9 @@ class SSHTransport:
         self._require_connection()
         args = [self.ssh_executable]
         args += self._common_args(control=False)
-        args += self._auth_args(password_prompt=False)
+        args += ["-o", "BatchMode=yes"]
         args += [self._destination, command]
-        result = self._run_process(args, timeout=timeout or self.timeout, env=self._askpass_environment())
+        result = self._run_process(args, timeout=timeout or self.timeout)
         if check and result.returncode:
             raise self._process_failure(result, "Remote command")
         return result
@@ -426,17 +382,14 @@ class SSHTransport:
         args = [self.sftp_executable, "-F", "/dev/null", "-q", "-b", "-"]
         args += ["-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={self.known_hosts}"]
         args += ["-o", "GlobalKnownHostsFile=/dev/null", "-o", f"ConnectTimeout={self.timeout}"]
-        args += ["-o", f"ControlPath={self._control_path}", "-o", "ControlMaster=no", "-o", "BatchMode=yes"]
+        args += ["-o", f"ControlPath={self._control_path}", "-o", "ControlMaster=no",
+                 "-o", "BatchMode=yes", "-o", "ProxyCommand=false"]
         args += ["-P", str(self.port)]
         if self.identity_file:
             args += ["-i", self.identity_file]
-        if is_tailcat_address(self.host):
-            tailcat_bin = find_host_tailcat()
-            if tailcat_bin:
-                args += ["-o", f"ProxyCommand='{tailcat_bin}' '{self.host}' '{self.port}' 2>/dev/null"]
         args += [self._sftp_destination]
         batch = ("\n".join(commands) + "\n").encode("utf-8")
-        result = self._run_process(args, input_data=batch, timeout=timeout or self.transfer_timeout, env=self._askpass_environment())
+        result = self._run_process(args, input_data=batch, timeout=timeout or self.transfer_timeout)
         if result.returncode:
             raise self._process_failure(result, "SFTP batch")
         return result
@@ -641,14 +594,25 @@ class SSHTransport:
             return total_kib * 1024, free_kib * 1024
         raise TransportCommandError("remote df returned no parseable filesystem record")
 
-    def refresh_library(self, paths: Optional[Sequence[str]] = None) -> None:
-        """Request native Kindle indexing on the remote host, not on the PC.
+    def refresh_library(self, paths: Optional[Sequence[str]] = None) -> bool:
+        """Return whether native indexing was requested; skip while KOReader is active.
 
-        If specific book paths are provided, attempts targeted file re-indexing via
-        `lipc-set-prop -i com.lab126.scanner reScanFile <path>` for each path.
-        If targeted indexing is not successful or no paths are provided, falls back
-        to a full library scan via `lipc-set-prop -i com.lab126.scanner doFullScan 1`.
+        Specific paths use reScanFile, falling back to doFullScan on failure.
+        Unknown foreground state preserves scanner errors rather than hiding them.
         """
+        app = self._remote_command(
+            "lipc-get-prop com.lab126.appmgrd activeApp", check=False,
+        )
+        context = self._remote_command(
+            "lipc-get-prop com.lab126.appmgrd activeContext", check=False,
+        )
+        if (
+            app.returncode == 0 and context.returncode == 0
+            and app.stdout.strip() == b"tech.hackerdude.shell_integration.launcher"
+            and context.stdout.strip().lower().endswith(b"/koreader.sh")
+        ):
+            return False
+
         if paths:
             all_succeeded = True
             for path in paths:
@@ -659,9 +623,10 @@ class SSHTransport:
                     all_succeeded = False
                     break
             if all_succeeded:
-                return
+                return True
 
         self._remote_command("lipc-set-prop -i com.lab126.scanner doFullScan 1")
+        return True
 
     def _choose_stage(self, parent: str) -> str:
         for _ in range(5):
@@ -924,461 +889,3 @@ def is_tailcat_address(host: str) -> bool:
     return host.startswith("tc") and "." not in host and len(host) >= 20
 
 
-def find_host_tailcat() -> Optional[str]:
-    """Find the tailcat client executable on the host system."""
-    for name in ("tailcat", "tailcat.exe"):
-        which = shutil.which(name)
-        if which and os.path.isfile(which) and os.access(which, os.X_OK):
-            return which
-    candidates = [
-        os.path.expanduser("~/go/bin/tailcat"),
-        os.path.expanduser("~/go/bin/tailcat.exe"),
-        os.path.expanduser("~/.local/bin/tailcat"),
-        "/opt/homebrew/bin/tailcat",
-        "/usr/local/bin/tailcat",
-    ]
-    for c in candidates:
-        if os.path.isfile(c) and os.access(c, os.X_OK):
-            return c
-    return None
-
-
-def probe_host(host: str, port: int, timeout: float = 1.0) -> bool:
-    """Probe if the remote host/port is reachable."""
-    if not host:
-        return False
-    if is_tailcat_address(host):
-        tailcat_bin = find_host_tailcat()
-        if not tailcat_bin:
-            return False
-        timeout_sec = max(1, int(timeout))
-        try:
-            res = subprocess.run(
-                [tailcat_bin, "ping", f"--timeout={timeout_sec}s", host],
-                capture_output=True,
-                timeout=timeout_sec + 2,
-                check=False,
-            )
-            return res.returncode == 0
-        except (subprocess.SubprocessError, OSError):
-            return False
-    else:
-        norm_host = host[1:-1] if host.startswith("[") and host.endswith("]") else host
-        try:
-            with socket.create_connection((norm_host, int(port)), timeout=max(0.5, timeout)):
-                return True
-        except OSError:
-            return False
-
-
-DEFAULT_TAILCAT_VERSION = "v0.7.0"
-TAILCAT_RELEASE_BASE_URL = "https://github.com/tailscale/tailcat/releases/download"
-
-
-def get_kindle_architecture(options: Dict[str, Any]) -> str:
-    """Query Kindle CPU architecture over SSH (returns 'armv7' or 'arm64')."""
-    transport = SSHTransport(options)
-    transport.connect()
-    try:
-        res = transport._remote_command("uname -m 2>/dev/null || echo armv7l", check=False)
-        raw_arch = transport._decode(res.stdout).strip().lower()
-        if "aarch64" in raw_arch or "arm64" in raw_arch:
-            return "arm64"
-        return "armv7"
-    finally:
-        transport.close()
-
-
-def get_tailcat_cache_dir() -> str:
-    """Return local cache directory for downloaded Tailcat release binaries."""
-    cache_base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
-    path = os.path.join(cache_base, "calibre-kindle-sftp", "bin")
-    os.makedirs(path, exist_ok=True)
-    return path
-
-
-def download_tailcat_binary(
-    arch: str = "armv7",
-    version: str = DEFAULT_TAILCAT_VERSION,
-    logger: Optional[Callable[[str], Any]] = None,
-) -> Tuple[str, Optional[str]]:
-    """Download official Tailcat release binary from GitHub if not already cached.
-
-    Returns a tuple of (binary_path, license_path).
-    """
-    import io
-    import tarfile
-    import urllib.request
-
-    def log(msg: str):
-        if logger:
-            logger(msg)
-
-    cache_dir = get_tailcat_cache_dir()
-    bin_filename = f"tailcat_{version}_{arch}"
-    lic_filename = f"LICENSE_tailcat_{version}"
-    bin_path = os.path.join(cache_dir, bin_filename)
-    lic_path = os.path.join(cache_dir, lic_filename)
-
-    if os.path.isfile(bin_path) and os.access(bin_path, os.X_OK):
-        log(f"Using cached official Tailcat binary: {bin_path}")
-        return bin_path, lic_path if os.path.isfile(lic_path) else None
-
-    ver_num = version.lstrip("v")
-    archive_name = f"tailcat_{ver_num}_linux_{arch}.tar.gz"
-    url = f"{TAILCAT_RELEASE_BASE_URL}/{version}/{archive_name}"
-
-    log(f"Downloading official Tailcat release ({version}, {arch}) from GitHub...")
-    log(f"URL: {url}")
-
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Calibre-Kindle-SFTP-Plugin/1.0"},
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            total_size_hdr = resp.headers.get("Content-Length")
-            total_size = int(total_size_hdr) if total_size_hdr and total_size_hdr.isdigit() else 0
-            chunks = []
-            downloaded = 0
-            while True:
-                chunk = resp.read(64 * 1024)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                downloaded += len(chunk)
-                if total_size > 0 and len(chunks) % 20 == 0:
-                    pct = int(downloaded * 100 / total_size)
-                    log(f"Downloading Tailcat... {downloaded / 1024 / 1024:.1f} MB / {total_size / 1024 / 1024:.1f} MB ({pct}%)")
-
-        archive_data = b"".join(chunks)
-        log(f"Download complete ({len(archive_data) / 1024 / 1024:.1f} MB). Extracting binary...")
-    except Exception as exc:
-        raise RuntimeError(f"Failed to download Tailcat from {url}: {exc}") from exc
-
-    try:
-        with tarfile.open(fileobj=io.BytesIO(archive_data), mode="r:gz") as tar:
-            bin_member = None
-            lic_member = None
-            for member in tar.getmembers():
-                name = os.path.basename(member.name)
-                if name == "tailcat":
-                    bin_member = member
-                elif name.startswith("LICENSE"):
-                    lic_member = member
-
-            if not bin_member:
-                raise RuntimeError(f"The downloaded archive {archive_name} does not contain an executable named 'tailcat'.")
-
-            extracted_bin = tar.extractfile(bin_member)
-            if not extracted_bin:
-                raise RuntimeError("Failed to extract 'tailcat' binary from archive.")
-
-            temp_bin = bin_path + ".tmp"
-            with open(temp_bin, "wb") as f:
-                f.write(extracted_bin.read())
-            os.chmod(temp_bin, 0o755)
-            os.replace(temp_bin, bin_path)
-
-            if lic_member:
-                extracted_lic = tar.extractfile(lic_member)
-                if extracted_lic:
-                    temp_lic = lic_path + ".tmp"
-                    with open(temp_lic, "wb") as f:
-                        f.write(extracted_lic.read())
-                    os.replace(temp_lic, lic_path)
-    except Exception as exc:
-        if os.path.exists(bin_path + ".tmp"):
-            os.unlink(bin_path + ".tmp")
-        raise RuntimeError(f"Failed to unpack Tailcat archive: {exc}") from exc
-
-    log(f"Extracted Tailcat executable to {bin_path}")
-    return bin_path, lic_path if os.path.isfile(lic_path) else None
-
-
-def get_bundled_tailcat_arm_path() -> Optional[str]:
-    """Locate bundled or cached ARM tailcat binary if present."""
-    local = os.path.join(os.path.dirname(__file__), "bin", "tailcat-arm")
-    if os.path.isfile(local) and os.access(local, os.R_OK):
-        return os.path.abspath(local)
-    cache_bin = os.path.join(get_tailcat_cache_dir(), f"tailcat_{DEFAULT_TAILCAT_VERSION}_armv7")
-    if os.path.isfile(cache_bin) and os.access(cache_bin, os.R_OK):
-        return cache_bin
-    return None
-
-
-def enroll_host_key_for_tailcat(
-    original_host: str,
-    original_port: int,
-    tc_addr: str,
-    known_hosts_path: str,
-) -> bool:
-    """Copy or record the trusted SSH host key from original_host to tc_addr in known_hosts."""
-    expanded_path = os.path.abspath(os.path.expanduser(known_hosts_path))
-    if not os.path.isfile(expanded_path):
-        return False
-    try:
-        with open(expanded_path, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-    except OSError:
-        return False
-
-    norm_orig = original_host[1:-1] if original_host.startswith("[") and original_host.endswith("]") else original_host
-    orig_prefix = f"[{norm_orig}]:{original_port}" if original_port != 22 else norm_orig
-
-    keys_to_add = []
-    tc_lower = tc_addr.lower()
-    tc_prefix = f"{tc_lower},{tc_addr}"
-
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        parts = stripped.split()
-        if len(parts) >= 3:
-            hosts = parts[0].split(",")
-            if tc_addr in hosts or tc_lower in hosts:
-                return True  # Already enrolled
-            if orig_prefix in hosts or norm_orig in hosts:
-                keys_to_add.append((parts[1], parts[2]))
-
-    if not keys_to_add:
-        return False
-
-    new_entries = []
-    for key_type, key_b64 in keys_to_add:
-        new_entries.append(f"{tc_prefix} {key_type} {key_b64}\n")
-
-    try:
-        with open(expanded_path, "a", encoding="utf-8") as f:
-            f.writelines(new_entries)
-        return True
-    except OSError:
-        return False
-
-
-def deploy_tailcat(
-    options: Dict[str, Any],
-    binary_path: Optional[str] = None,
-    license_path: Optional[str] = None,
-    arch: str = "auto",
-    force_new_key: bool = False,
-    logger: Optional[Callable[[str], Any]] = None,
-) -> str:
-    """Deploy Tailcat to a jailbroken Kindle via SFTP/SSH into /mnt/us/tailcat.
-
-    If binary_path is None, automatically resolves the Kindle architecture and downloads
-    the official Tailcat release from GitHub on demand.
-    Uploads the tailcat binary, license, and scriptlets, generates or reads the
-    permanent Tailcat address, and ensures permissions are set.
-    Returns the permanent tailcat address (e.g. 'tcpGFw...').
-    """
-    def log(msg: str):
-        if logger:
-            logger(msg)
-
-    if not binary_path:
-        target_arch = arch
-        if not target_arch or target_arch == "auto":
-            log("Resolving Kindle architecture...")
-            target_arch = get_kindle_architecture(options)
-            log(f"Kindle architecture resolved: {target_arch}")
-        binary_path, dl_lic = download_tailcat_binary(arch=target_arch, logger=logger)
-        if not license_path:
-            license_path = dl_lic
-
-    if not os.path.isfile(binary_path):
-        raise ValueError(f"Tailcat binary not found at: {binary_path}")
-
-    log(f"Connecting to Kindle at {options.get('host')}:{options.get('port', 22)}...")
-    transport = SSHTransport(options)
-    transport.connect()
-    try:
-        remote_tailcat_dir = posixpath.join(transport.user_store, "tailcat")
-        remote_bin = posixpath.join(remote_tailcat_dir, "bin", "tailcat")
-        remote_key = posixpath.join(remote_tailcat_dir, "kindle.private.json")
-        remote_addr_file = posixpath.join(remote_tailcat_dir, "tailcat.addr")
-        start_script = posixpath.join(remote_tailcat_dir, "start-tailcat.sh")
-        stop_script = posixpath.join(remote_tailcat_dir, "stop-tailcat.sh")
-
-        local_size = os.path.getsize(binary_path)
-        stat_res = transport._remote_command(f"ls -l {SSHTransport._shell_quote(remote_bin)} 2>/dev/null || true", check=False)
-        out = transport._decode(stat_res.stdout)
-        if str(local_size) in out:
-            log(f"Tailcat binary already present on Kindle ({local_size / 1024 / 1024:.1f} MB). Skipping re-upload.")
-        else:
-            log(f"Uploading Tailcat binary ({local_size / 1024 / 1024:.1f} MB) to /mnt/us/tailcat/bin/tailcat...")
-            transport.upload_user_store_file(binary_path, "tailcat/bin/tailcat", mode=0o755)
-
-        if license_path and os.path.isfile(license_path):
-            log("Uploading Tailcat license (BSD 3-Clause) to /mnt/us/tailcat/LICENSE...")
-            transport.upload_user_store_file(license_path, "tailcat/LICENSE", mode=0o644)
-
-        # Check if key already exists on Kindle
-        key_exists = False
-        res = transport._remote_command(f"[ -f {SSHTransport._shell_quote(remote_key)} ] && echo EXISTS || echo NO", check=False)
-        if "EXISTS" in transport._decode(res.stdout):
-            key_exists = True
-
-        tc_addr = ""
-        if not key_exists or force_new_key:
-            log("Generating permanent server key with --fixed-region...")
-            gen_res = transport._remote_command(
-                f"{SSHTransport._shell_quote(remote_bin)} genkey --fixed-region --force "
-                f"--key={SSHTransport._shell_quote(remote_key)}"
-            )
-            out = transport._decode(gen_res.stdout)
-            for line in out.splitlines():
-                line = line.strip()
-                if line.startswith("tc") and len(line) >= 20:
-                    tc_addr = line
-                    break
-            if not tc_addr:
-                err = transport._decode(gen_res.stderr)
-                raise TransportCommandError(f"Failed to generate permanent Tailcat key. Output: {out} {err}")
-        else:
-            log("Reading existing Tailcat address...")
-            addr_res = transport._remote_command(f"[ -f {SSHTransport._shell_quote(remote_addr_file)} ] && cat {SSHTransport._shell_quote(remote_addr_file)} || true", check=False)
-            addr_text = transport._decode(addr_res.stdout).strip()
-            if addr_text.startswith("tc") and len(addr_text) >= 20:
-                tc_addr = addr_text
-
-            if not tc_addr:
-                log("Determining permanent address from existing key...")
-                transport._remote_command(
-                    f"TAILCAT_ADDR_FILE={SSHTransport._shell_quote(remote_addr_file)} "
-                    f"{SSHTransport._shell_quote(remote_bin)} serve --key={SSHTransport._shell_quote(remote_key)} --json 22 & "
-                    f"PID=$!; sleep 1; kill $PID 2>/dev/null || true",
-                    check=False
-                )
-                addr_res = transport._remote_command(f"cat {SSHTransport._shell_quote(remote_addr_file)} 2>/dev/null || true", check=False)
-                addr_text = transport._decode(addr_res.stdout).strip()
-                if addr_text.startswith("tc") and len(addr_text) >= 20:
-                    tc_addr = addr_text
-
-        if not tc_addr:
-            raise TransportCommandError("Could not retrieve Tailcat permanent address from Kindle.")
-
-        log(f"Permanent Tailcat address: {tc_addr}")
-        transport.upload_user_store_file(io.BytesIO(tc_addr.encode("utf-8") + b"\n"), "tailcat/tailcat.addr", mode=0o644)
-
-        log("Uploading start-tailcat.sh and stop-tailcat.sh scriptlets...")
-        start_sh = f"""#!/bin/sh
-# Name: Calibre - Start Tailcat
-# Author: @kvn1351
-# Start Tailcat server on Kindle (port 22 -> Dropbear)
-DIR="{remote_tailcat_dir}"
-BIN="$DIR/bin/tailcat"
-KEY="$DIR/kindle.private.json"
-PIDFILE="$DIR/tailcat.pid"
-LOGFILE="$DIR/tailcat.log"
-ADDRFILE="$DIR/tailcat.addr"
-
-if [ -f "$PIDFILE" ]; then
-    PID=$(cat "$PIDFILE")
-    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
-        echo "Tailcat is already running (PID $PID)."
-        exit 0
-    fi
-    rm -f "$PIDFILE"
-fi
-
-if [ ! -x "$BIN" ]; then
-    chmod +x "$BIN" 2>/dev/null
-fi
-
-if [ ! -f "$KEY" ]; then
-    echo "Tailcat key not found at $KEY. Run setup wizard first."
-    exit 1
-fi
-
-export TAILCAT_ADDR_FILE="$ADDRFILE"
-nohup "$BIN" serve --key="$KEY" 22 > "$LOGFILE" 2>&1 &
-PID=$!
-echo "$PID" > "$PIDFILE"
-echo "Tailcat started (PID $PID)."
-"""
-        stop_sh = f"""#!/bin/sh
-# Name: Calibre - Stop Tailcat
-# Author: @kvn1351
-# Stop Tailcat server on Kindle
-DIR="{remote_tailcat_dir}"
-PIDFILE="$DIR/tailcat.pid"
-
-if [ -f "$PIDFILE" ]; then
-    PID=$(cat "$PIDFILE")
-    if [ -n "$PID" ]; then
-        kill "$PID" 2>/dev/null
-        sleep 1
-        kill -9 "$PID" 2>/dev/null
-    fi
-    rm -f "$PIDFILE"
-    echo "Tailcat stopped."
-else
-    killall tailcat 2>/dev/null
-    echo "Tailcat stopped (killall)."
-fi
-"""
-        transport.upload_user_store_file(io.BytesIO(start_sh.encode("utf-8")), "tailcat/start-tailcat.sh", mode=0o755)
-        transport.upload_user_store_file(io.BytesIO(stop_sh.encode("utf-8")), "tailcat/stop-tailcat.sh", mode=0o755)
-
-        # 1. Documents library shortcuts (tap directly on Kindle Home Screen / Library)
-        doc_start = '#!/bin/sh\n# Name: Calibre - Start Tailcat\n# Author: @kvn1351\n/mnt/us/tailcat/start-tailcat.sh\n'
-        doc_stop = '#!/bin/sh\n# Name: Calibre - Stop Tailcat\n# Author: @kvn1351\n/mnt/us/tailcat/stop-tailcat.sh\n'
-        transport.upload_user_store_file(io.BytesIO(doc_start.encode("utf-8")), "documents/Calibre Start Tailcat.sh", mode=0o755)
-        transport.upload_user_store_file(io.BytesIO(doc_stop.encode("utf-8")), "documents/Calibre Stop Tailcat.sh", mode=0o755)
-        # Clean up legacy un-prefixed launchers if present
-        transport._remote_command("rm -f /mnt/us/documents/'Start Tailcat.sh' /mnt/us/documents/'Stop Tailcat.sh' 2>/dev/null || true", check=False)
-        transport._remote_command('lipc-set-prop -i com.lab126.scanner reScanFile "/mnt/us/documents/Calibre Start Tailcat.sh" 2>/dev/null || true', check=False)
-        transport._remote_command('lipc-set-prop -i com.lab126.scanner reScanFile "/mnt/us/documents/Calibre Stop Tailcat.sh" 2>/dev/null || true', check=False)
-        log("Installed Library shortcuts in /mnt/us/documents/ (Calibre Start/Stop Tailcat).")
-
-        # 2. KUAL menu entry (if /mnt/us/extensions exists)
-        ext_check = transport._remote_command("[ -d /mnt/us/extensions ] && echo YES || echo NO", check=False)
-        if "YES" in transport._decode(ext_check.stdout):
-            kual_config = """<?xml version="1.0" encoding="UTF-8"?>
-<extension>
-\t<information>
-\t\t<name>Calibre Tailcat</name>
-\t\t<version>1.0</version>
-\t\t<author>@kvn1351</author>
-\t\t<id>tailcat</id>
-\t</information>
-\t<menus>
-\t\t<menu type="json" dynamic="true">menu.json</menu>
-\t</menus>
-</extension>
-"""
-            kual_menu = """{
-\t"items": [
-\t\t{
-\t\t\t"name": "Calibre Tailcat",
-\t\t\t"priority": 1,
-\t\t\t"items": [
-\t\t\t\t{
-\t\t\t\t\t"name": "Start Calibre Tailcat",
-\t\t\t\t\t"priority": 1,
-\t\t\t\t\t"action": "/mnt/us/tailcat/start-tailcat.sh"
-\t\t\t\t},
-\t\t\t\t{
-\t\t\t\t\t"name": "Stop Calibre Tailcat",
-\t\t\t\t\t"priority": 2,
-\t\t\t\t\t"action": "/mnt/us/tailcat/stop-tailcat.sh"
-\t\t\t\t}
-\t\t\t]
-\t\t}
-\t]
-}
-"""
-            transport.upload_user_store_file(io.BytesIO(kual_config.encode("utf-8")), "extensions/tailcat/config.xml", mode=0o644)
-            transport.upload_user_store_file(io.BytesIO(kual_menu.encode("utf-8")), "extensions/tailcat/menu.json", mode=0o644)
-            log("Installed KUAL extension in /mnt/us/extensions/tailcat/.")
-
-        known_hosts = options.get("known_hosts") or "~/.ssh/known_hosts"
-        enroll_host_key_for_tailcat(options.get("host", ""), int(options.get("port", 22)), tc_addr, known_hosts)
-        log("Saved host key mapping in known_hosts.")
-
-        return tc_addr
-    finally:
-        transport.close()

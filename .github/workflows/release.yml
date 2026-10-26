@@ -16,33 +16,65 @@ permissions:
   contents: write
 
 jobs:
+  binaries:
+    name: Build kindle-link (${{ matrix.platform }})
+    strategy:
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            platform: darwin-arm64
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+            platform: darwin-x86_64
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build Rust CLI
+        run: cargo build --release --locked --manifest-path kindle-link/Cargo.toml --target ${{ matrix.target }}
+      - name: Name standalone CLI artifact
+        run: |
+          mkdir -p binaries
+          cp kindle-link/target/${{ matrix.target }}/release/kindle-link binaries/kindle-link-${{ matrix.platform }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kindle-link-${{ matrix.platform }}
+          path: binaries/*
+
   release:
     name: Build & Publish Release
+    needs: binaries
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Build plugin package
-        run: python3 build_plugin.py
-
-      - name: Verify package artifact
-        run: |
-          test -f build/KindleSFTP.zip || (echo "build/KindleSFTP.zip not found!" && exit 1)
-          ls -lh build/KindleSFTP.zip
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kindle-link-*
+          merge-multiple: true
+          path: binaries
+      - name: Build plugin package with all host binaries
+        run: python3 build_plugin.py --binaries-dir binaries
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag_name || github.ref_name }}
           name: ${{ github.event.inputs.tag_name || github.ref_name }}
-          files: build/KindleSFTP.zip
+          files: |
+            build/KindleSFTP.zip
+            binaries/kindle-link-*
           generate_release_notes: true
           draft: false
           prerelease: false

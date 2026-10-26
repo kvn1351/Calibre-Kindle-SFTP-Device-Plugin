@@ -27,7 +27,7 @@ from calibre.ebooks.metadata.book.base import Metadata
 from calibre.ebooks.metadata.book.json_codec import JsonCodec
 
 from calibre_plugins.kindle_sftp.config import FORMATS, connection_options, device_settings
-from calibre_plugins.kindle_sftp.transport import SSHTransport, probe_host
+from calibre_plugins.kindle_sftp.transport import SSHTransport
 
 
 class RemoteBook(USBBook):
@@ -51,9 +51,9 @@ class KindleSFTP(DevicePlugin, InterfaceActionBase):
     gui_name = 'Kindle (SFTP)'
     description = 'Manage books on a jailbroken Kindle over SSH/SFTP without USB storage or KOReader.'
     author = 'Kevin Johansson (@kvn1351)'
-    version = (0, 9, 0)
+    version = (0, 10, 0)
     minimum_calibre_version = (9, 15, 0)
-    supported_platforms = ['osx', 'linux', 'windows']
+    supported_platforms = ['osx', 'linux']
     actual_plugin = 'calibre_plugins.kindle_sftp.ui:KindleSFTPAction'
     MANAGES_DEVICE_PRESENCE = True
     CAN_SET_METADATA = []
@@ -162,8 +162,16 @@ class KindleSFTP(DevicePlugin, InterfaceActionBase):
             if not force_refresh and not self._manual_connect_requested and now < self._next_probe:
                 return None
             self._next_probe = now + 10
-            if not probe_host(options['host'], options['port'], timeout=min(1.0, options.get('timeout', 8))):
-                return None
+            if self._transport is None:
+                transport = SSHTransport(options)
+                try:
+                    transport.connect()
+                    self._transport = transport
+                except Exception as error:
+                    transport.close()
+                    self.last_error = str(error)
+                    self._next_probe = time.monotonic() + 30
+                    return None
             self._manual_connect_requested = False
             return (options['host'], options['port'])
 
@@ -173,8 +181,7 @@ class KindleSFTP(DevicePlugin, InterfaceActionBase):
             if self._stopped or not options.get('enabled', True) or self._ejected:
                 raise RuntimeError('Kindle SFTP connection is disabled or ejected. Save plugin settings to reconnect.')
             self._manual_connect_requested = False
-            self._close_transport()
-            transport = SSHTransport(options)
+            transport = self._transport or SSHTransport(options)
             try:
                 transport.connect()
                 self._transport = transport
@@ -477,13 +484,23 @@ class KindleSFTP(DevicePlugin, InterfaceActionBase):
     def _refresh_library(self, paths=None):
         self.report_progress(-1, 'Requesting native Kindle library refresh…')
         try:
-            self._connection().refresh_library(paths=paths)
+            requested = self._connection().refresh_library(paths=paths)
         except Exception as error:
             raise RuntimeError(
                 'Book files changed on the Kindle, but its native library refresh failed. '
                 'Check that the stock framework/scanner is running and that the SSH user can set '
                 f'com.lab126.scanner properties. Original error: {error}'
             ) from error
+        if not requested:
+            self.report_progress(
+                -1, 'KOReader is active; native library refresh skipped. '
+                'Return to the Kindle library and request a full refresh from the toolbar menu.',
+            )
+
+    def refresh_library(self):
+        """Request a manual full scan on Calibre's device job thread."""
+        with self._lock:
+            return self._connection().refresh_library()
 
     def delete_books(self, paths, end_session=True):
         with self._lock:

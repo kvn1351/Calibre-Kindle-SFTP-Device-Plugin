@@ -16,7 +16,7 @@ Connect Calibre to your jailbroken Kindle wirelessly over SSH/SFTP with the full
 - 📶 **Wireless Transfers**: Sync your books over your local Wi-Fi without searching for cables.
 - 🌐 **1-Click Remote Access (Tailcat)**: Connect securely anywhere outside your home or on public Wi-Fi using encrypted WireGuard peer-to-peer tunnels without port forwarding.
 - 🖼️ **Flawless Book Covers**: Automatically generates and uploads companion cover thumbnails for lockscreen and library display (immune to Amazon's cover bug).
-- 📚 **Instant Native Indexing**: Sideloaded books appear immediately in your Kindle library via native scanner refresh (`com.lab126.scanner`).
+- 📚 **Native Indexing**: Requests asynchronous native scanner indexing (`com.lab126.scanner`), with KOReader-aware skipping and a manual full-refresh action.
 - ⚡ **Fast Library Caching**: Caches book metadata locally for fast incremental reconnections.
 - 🔒 **Secure & Private**: Strict SSH host-key verification against `known_hosts`; no third-party cloud accounts or open firewall ports required.
 - 📖 **Stock Interface**: Keep reading with Amazon's stock reader interface—no need to keep KOReader open.
@@ -35,6 +35,26 @@ Connect Calibre to your jailbroken Kindle wirelessly over SSH/SFTP with the full
 6. Click **Link Kindle Wi-Fi** on the toolbar to connect!
 
 ---
+
+## Native library refresh and KOReader
+
+After uploads, the plugin requests targeted indexing, falling back to a full scan if needed. Deletions request a full scan. These requests are asynchronous: a successful request does not prove indexing has finished or that the native library has updated onscreen.
+
+Before requesting a scan, the plugin reads `com.lab126.appmgrd`'s `activeApp` and `activeContext`. When the shell-integration launcher is active with a context ending in `/KOReader.sh`, it skips all native scanner commands. Book transfers, cover uploads, and Calibre metadata handling continue normally. Unknown foreground state does not suppress genuine scanner errors.
+
+After leaving KOReader and returning to Amazon's native library, open the toolbar arrow menu and select **Full refresh Kindle library**, immediately above **Preferences…**. This action requires a connected Kindle and runs through Calibre's device job queue, without changing book files. If KOReader is still active, it explains that the refresh was skipped. It does not close KOReader, restart services, or automatically retry later.
+
+### Changes in 0.9.1
+
+- Skip native refresh during KOReader transfers and deletions instead of failing with a missing scanner source.
+- Add the manual full-refresh toolbar menu action, disabled while disconnected or already queued.
+
+### Local verification
+
+Run `python3 tests/integration.py` with Calibre and OpenSSH installed. The suite uses a private loopback SSH/SFTP server, synthetic books, and a disposable Calibre profile/library; it never connects to a Kindle. All 13 checks passed, including KOReader transfer/deletion without scanner calls, later manual full scans, visible scanner errors outside KOReader, and the Qt menu action executing a queued scan. The menu was also rendered and visually inspected. Actual device indexing remains unverified by these local checks.
+
+---
+
 
 ## Remote Access with Tailcat (Optional)
 

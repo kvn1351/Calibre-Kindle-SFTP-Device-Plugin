@@ -27,12 +27,10 @@ def client_tests():
     from calibre.ebooks.metadata.meta import get_metadata
     from calibre.gui2 import Application
     from calibre.gui2.library.models import BooksModel
-    from calibre_plugins.kindle_sftp.config import prefs
+    from calibre_plugins.kindle_sftp.config import prefs, get_devices, save_devices, connection_options
+    from calibre_plugins.kindle_sftp.broker import executable, get_host_keys, setup_tailcat, uninstall_tailcat
     from calibre_plugins.kindle_sftp.transport import (
         SSHTransport, TransportCommandError, TransportError, TransportSecurityError,
-        deploy_tailcat, download_tailcat_binary, enroll_host_key_for_tailcat,
-        find_host_tailcat, get_kindle_architecture, is_tailcat_address,
-        probe_host,
     )
 
     app = Application([])
@@ -44,24 +42,25 @@ def client_tests():
 
     class Integration(unittest.TestCase):
         def setUp(self):
-            self.root = fixture / 'documents' / self._testMethodName
+            self.user_store = fixture / 'documents' / self._testMethodName
+            self.root = self.user_store / 'documents'
             self.root.mkdir(parents=True)
-            self.user_store = fixture / 'store' / self._testMethodName
-            self.user_store.mkdir(parents=True)
             self.options = {**state['options'], 'documents': str(self.root), 'user_store': str(self.user_store)}
             with prefs:
-                for key, value in self.options.items():
-                    prefs[key] = value
+                prefs['registry_migrated'] = True
                 prefs['enabled'] = True
                 prefs['auto_connect'] = True
                 prefs['read_metadata'] = True
                 prefs['generation'] = uuid.uuid4().hex
+            row = {**self.options, 'id': 'fixture:lan', 'device_id': 'fixture',
+                   'endpoint': 'lan', 'alias': 'Fixture Kindle'}
+            save_devices([row], active_id=row['id'])
             self.plugin = type(template)(template.plugin_path)
             self.plugin.startup()
 
         def tearDown(self):
             self.plugin.shutdown()
-            for marker in ('fail-scanner', 'fail-commit'):
+            for marker in ('fail-scanner', 'fail-commit', 'foreground.json', 'fail-appmgr'):
                 (fixture / marker).unlink(missing_ok=True)
             shutil.rmtree(self.root, ignore_errors=True)
             shutil.rmtree(self.user_store, ignore_errors=True)
@@ -134,9 +133,9 @@ def client_tests():
 
         @unittest.skipUnless(state['ipv6'], 'IPv6 loopback unavailable')
         def test_bracketed_ipv6_detection_and_sftp(self):
-            with prefs:
-                prefs['host'] = '[::1]'
-                prefs['generation'] = uuid.uuid4().hex
+            rows = get_devices()
+            rows[0]['host'] = '[::1]'
+            save_devices(rows, active_id=rows[0]['id'])
             self.connect()
             target = str(self.root / 'ipv6.txt')
             transport = self.plugin._connection()
@@ -218,6 +217,54 @@ def client_tests():
             (fixture / 'fail-scanner').unlink()
             self.plugin.delete_books([str(committed[0])])
             self.assertEqual(len(self.scans()), before + 1)
+
+        def test_koreader_transfer_delete_and_later_full_refresh(self):
+            self.connect()
+            foreground = fixture / 'foreground.json'
+            foreground.write_text(json.dumps({
+                'activeApp': 'tech.hackerdude.shell_integration.launcher',
+                'activeContext': ':2:file:///mnt/us/documents/KOReader.sh',
+            }))
+            (fixture / 'fail-scanner').touch()
+            before_calls = self.scanner_calls()
+            source = fixture / 'source.txt'
+            info = self.metadata('Reading in KOReader', 20)
+            locations = self.plugin.upload_books([str(source)], ['source.txt'], metadata=[info])
+            target = Path(locations[0][0])
+            self.assertEqual(target.read_bytes(), source.read_bytes())
+            self.assertIn(str(target), self.plugin._files)
+            books = self.plugin.books()
+            self.plugin.add_books_to_metadata(locations, [info], (books, None, None))
+            self.plugin.sync_booklists((books, None, None))
+            self.assertEqual(next(b for b in books if b.path == str(target)).uuid, info.uuid)
+            self.assertFalse(self.plugin.refresh_library())
+            self.plugin.delete_books([str(target)])
+            self.assertFalse(target.exists())
+            self.assertEqual(self.scanner_calls(), before_calls)
+            (fixture / 'fail-scanner').unlink()
+            foreground.unlink()
+            self.assertTrue(self.plugin.refresh_library())
+            self.assertEqual(self.scanner_calls()[len(before_calls):],
+                             [{'action': 'doFullScan', 'target': None}])
+            self.assertNotIn(str(target.relative_to(fixture / 'documents')), self.scans()[-1])
+
+        def test_other_launcher_and_unknown_foreground_do_not_hide_scanner_errors(self):
+            self.connect()
+            foreground = fixture / 'foreground.json'
+            foreground.write_text(json.dumps({
+                'activeApp': 'tech.hackerdude.shell_integration.launcher',
+                'activeContext': ':2:file:///mnt/us/documents/Other.sh',
+            }))
+            self.assertTrue(self.plugin.refresh_library())
+            self.assertEqual(self.scanner_calls()[-1], {'action': 'doFullScan', 'target': None})
+            foreground.write_text(json.dumps({
+                'activeApp': 'tech.hackerdude.shell_integration.launcher',
+                'activeContext': ':2:file:///mnt/us/documents/KOReader.sh',
+            }))
+            (fixture / 'fail-appmgr').touch()
+            (fixture / 'fail-scanner').touch()
+            with self.assertRaises(TransportCommandError):
+                self.plugin.refresh_library()
 
         def test_partial_upload_refreshes_successfully_committed_books(self):
             self.connect()
@@ -338,274 +385,416 @@ def client_tests():
             self.assertEqual(uploaded_sys.read_bytes(), sample_thumb)
             self.assertEqual(uploaded_bug.read_bytes(), sample_thumb)
 
-        def test_toolbar_action_and_multiple_kindle_profiles(self):
-            from calibre_plugins.kindle_sftp.config import (
-                get_devices, save_devices, get_active_device, get_active_device_id,
-                set_active_device_id, connection_options,
-            )
+        def test_manual_full_refresh_menu_queues_scan_on_connected_device(self):
+            from queue import Queue
+            from threading import Thread
+            from types import SimpleNamespace
+            from calibre.gui2.device import DeviceManager
             from calibre_plugins.kindle_sftp.ui import KindleSFTPAction
 
-            # 1. Test Multiple Kindle device profiles configuration
-            dev1 = {
-                'id': 'pw5-test',
-                'alias': 'Paperwhite 5',
-                'host': '192.168.1.101',
-                'port': 22,
-                'username': 'root',
-                'password': '',
-                'remember_password': False,
-                'identity_file': '',
-                'documents': '/mnt/us/documents',
-                'user_store': '',
-            }
-            dev2 = {
-                'id': 'oasis-test',
-                'alias': 'Kindle Oasis',
-                'host': '192.168.1.102',
-                'port': 2222,
-                'username': 'root',
-                'password': 'secretpassword',
-                'remember_password': True,
-                'identity_file': '',
-                'documents': '/mnt/us/documents',
-                'user_store': '',
-            }
-            save_devices([dev1, dev2], active_id='pw5-test')
-            self.assertEqual(len(get_devices()), 2)
-            self.assertEqual(get_active_device_id(), 'pw5-test')
-            self.assertEqual(get_active_device()['alias'], 'Paperwhite 5')
-            opts1 = connection_options()
-            self.assertEqual(opts1['host'], '192.168.1.101')
-            self.assertEqual(opts1['port'], 22)
-
-            # Switch active device
-            set_active_device_id('oasis-test')
-            self.assertEqual(get_active_device_id(), 'oasis-test')
-            opts2 = connection_options()
-            self.assertEqual(opts2['host'], '192.168.1.102')
-            self.assertEqual(opts2['port'], 2222)
-            self.assertEqual(opts2['password'], 'secretpassword')
-
-            # 2. Test Toolbar Action instantiation & UI elements
+            self.connect()
+            registered = []
+            manager = DeviceManager(
+                None, SimpleNamespace(add_job=registered.append, changed_queue=Queue()),
+                None, None, None, None,
+            )
+            manager.connected_device = self.plugin
+            previous_manager = getattr(app, 'device_manager', None)
+            app.device_manager = manager
             action = KindleSFTPAction(app, '')
-            action.interface_action_base_plugin = self.plugin
-            action.do_genesis()
+            try:
+                action.interface_action_base_plugin = self.plugin
+                action.do_genesis()
+                action.menu.show()
+                app.processEvents()
+                before_calls = len(self.scanner_calls())
+                action.refresh_action.trigger()
+                self.assertEqual(self.scanner_calls()[before_calls:], [])
+                self.assertFalse(action.refresh_action.isEnabled())
+                action.rebuild_menu()
+                self.assertFalse(action.refresh_action.isEnabled())
+                job = manager.jobs.get_nowait()
+                worker = Thread(target=job.run)
+                worker.start()
+                deadline = time.monotonic() + 15
+                while action._refresh_pending and time.monotonic() < deadline:
+                    app.processEvents()
+                    time.sleep(0.01)
+                worker.join(timeout=1)
+                self.assertFalse(action._refresh_pending)
+                self.assertFalse(job.failed, job.details)
+                self.assertTrue(action.refresh_action.isEnabled())
+                self.assertEqual(self.scanner_calls()[before_calls:],
+                                 [{'action': 'doFullScan', 'target': None}])
+                manager.connected_device = None
+                action.update_button_state()
+                self.assertFalse(action.refresh_action.isEnabled())
+            finally:
+                action._poll_timer.stop()
+                action.menu.close()
+                action.deleteLater()
+                app.device_manager = previous_manager
 
-            # Main button text initially
-            self.assertEqual(action.qaction.text(), 'Link Kindle Wi-Fi')
+        def test_registry_and_calibre_share_devices_selection_and_conflicts(self):
+            from types import SimpleNamespace
+            from calibre_plugins.kindle_sftp.broker import frontend, sync_devices
+            from calibre_plugins.kindle_sftp.config import (
+                get_active_device_id, registry_revision, set_active_device_id,
+            )
+            from calibre_plugins.kindle_sftp.ui import KindleSFTPAction, ManageConnectionsDialog
+            rows = get_devices()
+            other = {**rows[0], 'id': 'second:lan', 'device_id': 'second',
+                     'alias': 'Second Kindle', 'host': '192.0.2.2', 'password': 'memory-only-secret'}
+            rows.append(other)
+            save_devices(rows, active_id='fixture:lan')
+            devices = json.loads(subprocess.check_output([executable(), 'devices', '--json']))['devices']
+            self.assertEqual({d['id'] for d in devices}, {'fixture', 'second'})
+            registry_file = Path(os.environ['XDG_CONFIG_HOME']) / 'tailcat/devices.json'
+            if not registry_file.exists():
+                registry_file = Path(os.environ['XDG_CONFIG_HOME']) / 'tailcat/devices.json'
+            if not registry_file.exists():
+                registry_file = Path(os.environ['XDG_CONFIG_HOME']) / 'kindle-link/devices.json'
+            self.assertNotIn(b'memory-only-secret', registry_file.read_bytes())
+            subprocess.run([executable(), 'use', 'second'], check=True, capture_output=True)
+            self.assertEqual(connection_options()['host'], '192.0.2.2')
+            self.assertEqual(connection_options()['password'], 'memory-only-secret')
+            before = frontend()
+            dialog = ManageConnectionsDialog(None)
+            try:
+                dialog.edit_host.setText('192.0.2.99')
+                dialog._on_field_edited()
+                dialog.reject()
+                self.assertEqual(frontend(), before, 'Cancel persisted draft edits')
+                # A CLI update must not be overwritten by a dialog's stale snapshot.
+                newer = frontend()
+                newer['devices'][0]['alias'] = 'Renamed through CLI'
+                sync_devices(newer['devices'], newer['active_id'], newer['revision'])
+                with self.assertRaises(RuntimeError):
+                    save_devices(dialog.devices, dialog.active_id, revision=dialog.revision)
+                self.assertEqual(get_devices()[0]['alias'], 'Renamed through CLI')
+            finally:
+                dialog.close()
+                dialog.deleteLater()
+            previous_manager = getattr(app, 'device_manager', None)
+            app.device_manager = SimpleNamespace(is_device_connected=False, device=None)
+            action = KindleSFTPAction(app, '')
+            try:
+                action.interface_action_base_plugin = self.plugin
+                action.do_genesis()
+                selection = next(a.menu() for a in action.menu.actions() if a.menu())
+                first = next(a for a in selection.actions() if 'Renamed through CLI' in a.text())
+                first.trigger()
+                self.assertEqual(get_active_device_id(), 'fixture:lan')
+                self.assertEqual(frontend()['active_id'], 'fixture:lan')
+            finally:
+                action._poll_timer.stop()
+                action.deleteLater()
+                app.device_manager = previous_manager
 
-            # Test Menu structure
-            action.rebuild_menu()
-            menu_actions = action.menu.actions()
-            self.assertGreaterEqual(len(menu_actions), 3)
-            self.assertFalse(any('Manage Connections' in a.text() for a in menu_actions if not a.isSeparator()))
-
-            # Check Submenu "Selected Kindle"
-            submenus = [a.menu() for a in menu_actions if a.menu() and a.menu().title() == 'Selected Kindle']
-            self.assertEqual(len(submenus), 1)
-            sub_actions = submenus[0].actions()
-            labels = [a.text() for a in sub_actions]
-            self.assertTrue(any('Paperwhite 5' in lbl for lbl in labels))
-            self.assertTrue(any('Kindle Oasis' in lbl for lbl in labels))
-            self.assertTrue(any('Manage Connections' in lbl for lbl in labels))
-
-            # Trigger device selection from menu
-            oasis_action = next(a for a in sub_actions if 'Kindle Oasis' in a.text())
-            self.assertTrue(oasis_action.isChecked())
-
-            pw5_action = next(a for a in sub_actions if 'Paperwhite 5' in a.text())
-            pw5_action.trigger()
-            self.assertEqual(get_active_device_id(), 'pw5-test')
-
-            # 3. Simulate connection state changes
-            class MockConnectedDevice:
-                name = 'Kindle SFTP Device'
-
-            class MockDeviceManager:
-                is_device_connected = True
-                device = MockConnectedDevice()
-                def umount_device(self):
-                    self.is_device_connected = False
-
-            app.device_manager = MockDeviceManager()
-            action.update_button_state()
-            self.assertEqual(action.qaction.text(), 'Disconnect Kindle Wi-Fi')
-
-            # Toggle disconnect
-            action.toggle_connection()
-            self.assertFalse(app.device_manager.is_device_connected)
-            self.assertEqual(action.qaction.text(), 'Link Kindle Wi-Fi')
-
-            # 3b. Verify ManageConnectionsDialog Tailcat button visibility & no documents setting
-            from calibre_plugins.kindle_sftp.ui import ManageConnectionsDialog, TailcatInfoDialog
-            dlg = ManageConnectionsDialog(None, initial_device_id='pw5-test')
-            self.assertFalse(hasattr(dlg, 'edit_documents'))
-            self.assertFalse(dlg.btn_tailcat.isHidden())
-            self.assertFalse(dlg.btn_tailcat_help.isHidden())
-            # Use synthetic dummy Tailcat address for UI visibility testing
-            dummy_tc = "tcpGFwMOCK000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            dlg.edit_host.setText(dummy_tc)
-            dlg._on_field_edited()
-            self.assertTrue(dlg.btn_tailcat.isHidden())
-            self.assertTrue(dlg.btn_tailcat_help.isHidden())
-            dlg.close()
-
-            # 3c. Verify TailcatInfoDialog contents and uninstallation commands
-            info_dlg = TailcatInfoDialog(None, host='192.168.1.100')
-            self.assertIn('killall tailcat', info_dlg.UNINSTALL_CMD)
-            self.assertIn('Calibre Start Tailcat.sh', info_dlg.UNINSTALL_CMD)
-            self.assertIn('ssh root@192.168.1.100', info_dlg.ssh_cmd)
-            info_dlg.close()
-
-            # Default example IP without host provided, platform-agnostic, and clean branding
-            default_dlg = TailcatInfoDialog(None)
-            self.assertIn('ssh root@192.168.1.50', default_dlg.ssh_cmd)
-            default_dlg.close()
-
-            # 4. Test Auto-connect vs Manual-connect detection
-            live_dev = {
-                'id': 'live-test',
-                'alias': 'Live Test Kindle',
-                'host': self.options['host'],
-                'port': self.options['port'],
-                'username': self.options['username'],
-                'password': '',
-                'remember_password': False,
-                'identity_file': self.options['identity_file'],
-                'documents': str(self.root),
-                'user_store': str(self.user_store),
-            }
-            save_devices([live_dev], active_id='live-test')
-
-            # When auto_connect is False, background polling does NOT detect:
+        def test_manual_detection_requires_request_and_auto_detection_reconnects(self):
             with prefs:
                 prefs['auto_connect'] = False
-                prefs['generation'] = uuid.uuid4().hex
-            self.plugin._update_options()
-            self.plugin._manual_connect_requested = False
-            self.assertIsNone(self.plugin.detect_managed_devices(set(), force_refresh=False))
-
-            # When manual connect is requested:
+            self.assertIsNone(self.plugin.detect_managed_devices(set()))
             self.plugin._manual_connect_requested = True
-            dev_detected = self.plugin.detect_managed_devices(set(), force_refresh=False)
-            self.assertIsNotNone(dev_detected)
+            self.assertIsNotNone(self.plugin.detect_managed_devices(set()))
             self.assertFalse(self.plugin._manual_connect_requested)
-
-            # When auto_connect is True, background polling detects automatically:
+            self.plugin.open(None, 'manual-connection-fixture')
+            self.plugin.eject()
+            self.assertFalse(self.plugin._transport)
+            self.assertIsNone(self.plugin.detect_managed_devices(set()))
             with prefs:
                 prefs['auto_connect'] = True
                 prefs['generation'] = uuid.uuid4().hex
-            self.plugin._update_options()
-            self.plugin._next_probe = 0.0
-            self.assertIsNotNone(self.plugin.detect_managed_devices(set(), force_refresh=False))
+            self.assertIsNotNone(self.plugin.detect_managed_devices(set(), force_refresh=True))
 
-        def test_tailcat_helpers_and_deployment(self):
-            # 1. Address detection
-            valid_tc = "tcpGFwWCARC9nyT4M9SVE46qLzGwVVfusQ5M6XLt9vyLj2ps5zSWFrWC"
-            self.assertTrue(is_tailcat_address(valid_tc))
-            self.assertFalse(is_tailcat_address("192.168.1.150"))
-            self.assertFalse(is_tailcat_address("kindle.local"))
-            self.assertFalse(is_tailcat_address(""))
-            self.assertFalse(is_tailcat_address("tc.short"))
+        def test_existing_calibre_profiles_migrate_without_losing_cli_devices(self):
+            from calibre_plugins.kindle_sftp.config import get_active_device_id
+            address = 'tcLegacy_Profile-Address0123456789'
+            lan = {**self.options, 'id': 'old-local', 'alias': 'Legacy Reader',
+                   'password': 'legacy-secret', 'remember_password': True}
+            remote = {**lan, 'id': 'old-remote', 'alias': 'Legacy Reader (Tailscale)',
+                      'host': address, 'port': 22}
+            with prefs:
+                prefs['registry_migrated'] = False
+                prefs['devices'] = [lan, remote]
+                prefs['active_device_id'] = 'old-remote'
+            rows = get_devices()
+            self.assertIn('fixture:lan', [row['id'] for row in rows])
+            migrated = [row for row in rows if row['alias'].startswith('Legacy Reader')]
+            self.assertEqual({row['endpoint'] for row in migrated}, {'lan', 'tailcat'})
+            self.assertEqual(len({row['device_id'] for row in migrated}), 1)
+            self.assertEqual({row['password'] for row in migrated}, {'legacy-secret'})
+            self.assertEqual(get_active_device_id(), 'fixture:lan')
+            self.assertIsNone(prefs.get('devices'))
+            self.assertIsNone(prefs.get('password'))
+            registry_file = Path(os.environ['XDG_CONFIG_HOME']) / 'tailcat/devices.json'
+            if not registry_file.exists():
+                registry_file = Path(os.environ['XDG_CONFIG_HOME']) / 'kindle-link/devices.json'
+            self.assertNotIn(b'legacy-secret', registry_file.read_bytes())
 
-            # 2. Host key enrollment
-            kh_path = self.user_store / "test_known_hosts"
-            kh_path.write_text("127.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITESTKEY123456789\n")
-            self.assertTrue(enroll_host_key_for_tailcat("127.0.0.1", 22, valid_tc, str(kh_path)))
-            kh_content = kh_path.read_text()
-            self.assertIn(f"{valid_tc.lower()},{valid_tc}", kh_content)
-            self.assertIn("AAAAC3NzaC1lZDI1NTE5AAAAITESTKEY123456789", kh_content)
+        def test_cli_interactive_ssh_shell(self):
+            import pty
+            import select
+            import signal
+            config = self.user_store / 'shell-config.json'
+            config.write_text(json.dumps(self.options))
+            pid, terminal = pty.fork()
+            if pid == 0:
+                os.execv(executable(), [executable(), 'ssh', '--config', str(config)])
+            output = bytearray()
+            finished = False
+            try:
+                deadline = time.monotonic() + 20
+                status = None
+                sent = False
+                while time.monotonic() < deadline:
+                    if select.select([terminal], [], [], 0.1)[0]:
+                        try:
+                            chunk = os.read(terminal, 4096)
+                        except OSError:
+                            chunk = b''
+                        output.extend(chunk)
+                    if not sent and (b'$' in output or b'#' in output or b'>' in output or time.monotonic() > deadline - 15):
+                        os.write(terminal, b"printf '\\n%s_%s\\n' KINDLE_LINK SHELL_OK; exit\n")
+                        sent = True
+                    exited, status = os.waitpid(pid, os.WNOHANG)
+                    if exited:
+                        while select.select([terminal], [], [], 0.1)[0]:
+                            try:
+                                chunk = os.read(terminal, 4096)
+                                if not chunk:
+                                    break
+                                output.extend(chunk)
+                            except OSError:
+                                break
+                        finished = True
+                        break
+                self.assertTrue(finished, output.decode('utf-8', 'replace'))
+                self.assertEqual(os.waitstatus_to_exitcode(status), 0, output)
+                self.assertIn(b'KINDLE_LINK_SHELL_OK', output)
+            finally:
+                if not finished:
+                    os.kill(pid, signal.SIGKILL)
+                    os.waitpid(pid, 0)
+                os.close(terminal)
 
-            # 3. Download on demand & architecture detection helpers
-            arch = get_kindle_architecture(self.options)
-            self.assertIn(arch, ("armv7", "arm64"))
-
-            import io
-            import tarfile
-            from unittest.mock import MagicMock, patch
-
-            mock_tar_buf = io.BytesIO()
-            with tarfile.open(fileobj=mock_tar_buf, mode="w:gz") as tar:
-                bin_data = b"#!/bin/sh\necho test\n"
-                ti_bin = tarfile.TarInfo(name="tailcat")
-                ti_bin.size = len(bin_data)
-                tar.addfile(ti_bin, io.BytesIO(bin_data))
-
-                lic_data = b"BSD 3-Clause License\n"
-                ti_lic = tarfile.TarInfo(name="LICENSE")
-                ti_lic.size = len(lic_data)
-                tar.addfile(ti_lic, io.BytesIO(lic_data))
-
-            mock_tar_bytes = mock_tar_buf.getvalue()
-            mock_resp = MagicMock()
-            mock_resp.read = MagicMock(side_effect=[mock_tar_bytes, b""])
-            mock_resp.headers = {"Content-Length": str(len(mock_tar_bytes))}
-            mock_resp.__enter__.return_value = mock_resp
-
-            with patch("urllib.request.urlopen", return_value=mock_resp):
-                cached_bin, cached_lic = download_tailcat_binary(arch="testarch", version="v9.9.9")
-                self.assertTrue(os.path.isfile(cached_bin))
-                self.assertTrue(os.path.isfile(cached_lic))
-                self.assertTrue(os.access(cached_bin, os.X_OK))
-
-            # 4. Deployment to user store
-            mock_bin = self.user_store / "mock_tailcat.sh"
-            mock_bin.write_text(f"#!/bin/sh\ncase \"$*\" in *genkey*) echo '# wrote file'; echo '{valid_tc}';; *) echo 'tailcat mock';; esac\n")
-            mock_bin.chmod(0o755)
-
-            mock_lic = self.user_store / "mock_LICENSE"
-            mock_lic.write_text("BSD 3-Clause License\n")
-
-            logs = []
-            tc_addr = deploy_tailcat(
-                self.options,
-                str(mock_bin),
-                license_path=str(mock_lic),
-                force_new_key=True,
-                logger=logs.append,
+        def test_broker_crash_terminates_its_ssh_and_allows_restart(self):
+            import select
+            config = self.user_store / 'broker-crash.json'
+            config.write_text(json.dumps(self.options))
+            client = subprocess.Popen(
+                [executable(), 'lease', '--config', str(config)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
-            self.assertEqual(tc_addr, valid_tc)
-            self.assertTrue(any("Uploading Tailcat" in line for line in logs))
-            self.assertTrue(any("Generating permanent" in line for line in logs))
+            try:
+                self.assertTrue(select.select([client.stdout], [], [], 15)[0])
+                reply = json.loads(client.stdout.readline())
+                self.assertTrue(reply['ok'], reply)
+                status = json.loads(subprocess.check_output([executable(), 'status', '--json']))
+                master = next(c for c in status['connections'] if c['control_path'] == reply['control_path'])
+                broker_pid = int(subprocess.check_output(
+                    ['ps', '-p', str(master['master_pid']), '-o', 'ppid='],
+                ).strip())
+                os.kill(broker_pid, 9)
+                deadline = time.monotonic() + 10
+                while Path(reply['control_path']).exists() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertFalse(Path(reply['control_path']).exists(), 'Broker crash left SSH alive')
+                result = subprocess.run(
+                    [executable(), 'cmd', '--config', str(config), 'printf', 'broker-restarted'],
+                    capture_output=True, timeout=15,
+                )
+                self.assertEqual((result.returncode, result.stdout), (0, b'broker-restarted'), result.stderr)
+            finally:
+                client.stdin.close()
+                try:
+                    client.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    client.kill()
+                    client.wait(timeout=3)
+                client.stdout.close()
+                client.stderr.close()
 
-            # Verify deployed files in user_store
-            remote_bin = self.user_store / "tailcat" / "bin" / "tailcat"
-            self.assertTrue(remote_bin.is_file())
-            self.assertEqual(oct(remote_bin.stat().st_mode & 0o777), oct(0o755))
+        def test_cli_provisioning_preserves_identity_and_trust(self):
+            documents = self.user_store / 'documents'
+            documents.mkdir(exist_ok=True)
+            options = {**self.options, 'documents': str(documents)}
+            address = 'tcSynthetic_CaseSensitive-Address0123456789'
+            binary = self.user_store / 'synthetic-tailcat'
+            binary.write_text(f'''#!/usr/bin/python3
+import json, os, pathlib, sys, time
+key = pathlib.Path(next(a.split('=', 1)[1] for a in sys.argv if a.startswith('--key=')))
+if 'genkey' in sys.argv:
+    if key.exists() and '--force' not in sys.argv:
+        raise SystemExit(3)
+    value = {address!r} if not key.exists() else {address!r} + 'New'
+    key.write_text(json.dumps({{'address': value}}))
+    print(value)
+elif 'serve' in sys.argv:
+    pathlib.Path(os.environ['TAILCAT_ADDR_FILE']).write_text(json.loads(key.read_text())['address'])
+    time.sleep(30)
+else:
+    raise SystemExit(2)
+''')
+            binary.chmod(0o700)
+            license_path = self.user_store / 'synthetic-license'
+            license_path.write_bytes(b'Synthetic license fixture\\n')
+            result = setup_tailcat(options, str(binary), str(license_path))
+            self.assertEqual(result, address)
+            remote = self.user_store / 'tailcat'
+            self.assertEqual((remote / 'bin/tailcat').read_bytes(), binary.read_bytes())
+            self.assertEqual((remote / 'LICENSE').read_bytes(), license_path.read_bytes())
+            key_before = (remote / 'kindle.private.json').read_bytes()
+            trust_before = Path(options['known_hosts']).read_bytes()
+            self.assertEqual(setup_tailcat(options, str(binary), str(license_path)), address)
+            self.assertEqual((remote / 'kindle.private.json').read_bytes(), key_before)
+            self.assertEqual(Path(options['known_hosts']).read_bytes(), trust_before)
+            self.assertEqual((remote / 'tailcat.addr').read_text().strip(), address)
+            # Recovery must retain the saved key rather than silently replace it.
+            (remote / 'tailcat.addr').unlink()
+            self.assertEqual(setup_tailcat(options, str(binary), str(license_path)), address)
+            self.assertEqual((remote / 'kindle.private.json').read_bytes(), key_before)
+            self.assertEqual(
+                setup_tailcat(options, str(binary), str(license_path), force_new_key=True),
+                address + 'New',
+            )
+            self.assertNotEqual((remote / 'kindle.private.json').read_bytes(), key_before)
+            self.assertTrue((documents / 'Calibre Start Tailcat.sh').is_file())
+            self.assertTrue((documents / 'Calibre Stop Tailcat.sh').is_file())
+            self.assertEqual(list(remote.rglob('*.tmp-*')), [])
+            keys = get_host_keys(options)
+            trusted_key = (fixture / 'host_key.pub').read_text().split()[:2]
+            self.assertIn(trusted_key, [line.split()[1:3] for line in keys])
+            profiles = json.loads(subprocess.check_output([executable(), 'devices', '--json']))['devices']
+            device = next(d for d in profiles if d.get('tailcat', {}).get('host') == address + 'New')
+            unrelated = documents / 'unrelated-book.txt'
+            unrelated.write_bytes(b'Preserve this book during uninstall.')
+            owner = SSHTransport(self.options)
+            owner.connect()
+            try:
+                with self.assertRaises(RuntimeError):
+                    uninstall_tailcat(self.options)
+                self.assertTrue(remote.is_dir())
+            finally:
+                owner.close()
+            unrelated_process = subprocess.Popen(['sleep', '60'])
+            try:
+                (remote / 'tailcat.pid').write_text(str(unrelated_process.pid))
+                with self.assertRaises(RuntimeError):
+                    uninstall_tailcat(self.options)
+                self.assertIsNone(unrelated_process.poll(), 'Uninstall killed an unrelated process')
+                self.assertTrue(remote.is_dir())
+            finally:
+                unrelated_process.terminate()
+                unrelated_process.wait(timeout=5)
+                (remote / 'tailcat.pid').unlink(missing_ok=True)
+            removed = uninstall_tailcat(self.options)
+            self.assertTrue(removed.get('ok'))
+            self.assertFalse(remote.exists())
+            self.assertFalse((documents / 'Calibre Start Tailcat.sh').exists())
+            self.assertFalse((documents / 'Calibre Stop Tailcat.sh').exists())
+            self.assertEqual(unrelated.read_bytes(), b'Preserve this book during uninstall.')
+            remaining = json.loads(subprocess.check_output([executable(), 'devices', '--json']))['devices']
+            selected = next(d for d in remaining if d['id'] == device['id'])
+            self.assertIsNone(selected['tailcat'])
+            self.assertEqual(selected['lan']['host'], self.options['host'])
 
-            remote_lic = self.user_store / "tailcat" / "LICENSE"
-            self.assertTrue(remote_lic.is_file())
-            self.assertEqual(remote_lic.read_text(), "BSD 3-Clause License\n")
+        def test_shared_connection_survives_one_owner_and_closes_after_last_sigkill(self):
+            import select
+            binary = executable()
+            config = self.user_store / 'connection.json'
+            config.write_text(json.dumps(self.options))
+            config.chmod(0o600)
+            cli = subprocess.Popen(
+                [binary, 'lease', '--config', str(config)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            calibre = None
+            try:
+                self.assertTrue(select.select([cli.stdout], [], [], 15)[0], 'CLI lease never became ready')
+                first = json.loads(cli.stdout.readline())
+                self.assertTrue(first['ok'], first)
+                code = (
+                    'import json, time; '
+                    'from calibre.customize.ui import initialize_plugins; initialize_plugins(); '
+                    'from calibre_plugins.kindle_sftp.transport import SSHTransport; '
+                    f't = SSHTransport(json.load(open({str(config)!r}))); t.connect(); '
+                    'print(json.dumps({\"control_path\": t._control_path}), flush=True); time.sleep(120)'
+                )
+                calibre = subprocess.Popen(
+                    [state['calibre_debug'], '-c', code],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                self.assertTrue(select.select([calibre.stdout], [], [], 15)[0], 'Calibre lease never became ready')
+                raw_line = calibre.stdout.readline()
+                if not raw_line:
+                    err = calibre.stderr.read().decode('utf-8', 'replace')
+                    self.fail(f"calibre process sent empty line (exit code {calibre.poll()}). stderr: {err}")
+                second = json.loads(raw_line)
+                self.assertEqual(first['control_path'], second['control_path'])
+                status = json.loads(subprocess.check_output([binary, 'status', '--json']))
+                connection = next(c for c in status['connections'] if c['control_path'] == first['control_path'])
+                self.assertEqual(connection['leases'], 2)
+                master_pid = connection['master_pid']
+                calibre.kill()
+                calibre.wait(timeout=5)
+                command = subprocess.run(
+                    [binary, 'cmd', '--config', str(config), 'sh', '-c',
+                     'printf \"%s\" \"$1\"; printf \"synthetic stderr\" >&2; exit 7',
+                     'sh', 'spaces $ and \"quotes\"'],
+                    capture_output=True, timeout=15,
+                )
+                self.assertEqual(command.returncode, 7, command.stderr)
+                self.assertEqual(command.stdout, b'spaces $ and \"quotes\"')
+                self.assertEqual(command.stderr, b'synthetic stderr')
+                status = json.loads(subprocess.check_output([binary, 'status', '--json']))
+                self.assertEqual(status['connections'][0]['master_pid'], master_pid)
+                cli.kill()
+                cli.wait(timeout=5)
+                deadline = time.monotonic() + 10
+                while Path(first['control_path']).exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertFalse(Path(first['control_path']).exists(), 'Last owner death left an SSH master')
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(master_pid, 0)
+                        time.sleep(0.05)
+                    except ProcessLookupError:
+                        break
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(master_pid, 0)
+            finally:
+                for child in (cli, calibre):
+                    if child is not None:
+                        if child.poll() is None:
+                            child.kill()
+                            child.wait(timeout=5)
+                        for stream in (child.stdin, child.stdout, child.stderr):
+                            if stream is not None:
+                                stream.close()
 
-            remote_start = self.user_store / "tailcat" / "start-tailcat.sh"
-            self.assertTrue(remote_start.is_file())
-            self.assertEqual(oct(remote_start.stat().st_mode & 0o777), oct(0o755))
-            self.assertIn("nohup", remote_start.read_text())
-
-            remote_stop = self.user_store / "tailcat" / "stop-tailcat.sh"
-            self.assertTrue(remote_stop.is_file())
-            self.assertEqual(oct(remote_stop.stat().st_mode & 0o777), oct(0o755))
-
-            remote_addr = self.user_store / "tailcat" / "tailcat.addr"
-            self.assertTrue(remote_addr.is_file())
-            self.assertIn(valid_tc, remote_addr.read_text())
-
-            doc_start = self.user_store / "documents" / "Calibre Start Tailcat.sh"
-            self.assertTrue(doc_start.is_file())
-            self.assertEqual(oct(doc_start.stat().st_mode & 0o777), oct(0o755))
-            doc_content = doc_start.read_text()
-            self.assertIn("Author: @kvn1351", doc_content)
-            self.assertIn("Name: Calibre - Start Tailcat", doc_content)
-
-            # 5. Transport ProxyCommand configuration
-            tailcat_opts = dict(self.options)
-            tailcat_opts["host"] = valid_tc
-            t = SSHTransport(tailcat_opts)
-            t._runtime_dir = str(self.user_store / "t_runtime")
-            t._control_path = str(self.user_store / "t_runtime" / "sock")
-            args = t._common_args(control=False)
-            self.assertTrue(any("ProxyCommand=" in arg for arg in args))
-            self.assertTrue(any(valid_tc in arg for arg in args))
+        def test_concurrent_clients_coalesce_and_reject_different_trust(self):
+            from concurrent.futures import ThreadPoolExecutor
+            clients = [SSHTransport(self.options) for _ in range(4)]
+            try:
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    list(pool.map(lambda client: client.connect(), clients))
+                self.assertEqual(len({client._control_path for client in clients}), 1)
+                clients[0].close()
+                self.assertEqual(clients[1]._remote_command('printf still-connected').stdout, b'still-connected')
+                unknown_hosts = self.user_store / 'different-known-hosts'
+                unknown_hosts.write_text('')
+                untrusted = SSHTransport({**self.options, 'known_hosts': str(unknown_hosts)})
+                try:
+                    with self.assertRaises(TransportError):
+                        untrusted.connect()
+                finally:
+                    untrusted.close()
+                self.assertEqual(clients[1]._remote_command('printf trusted-owner').stdout, b'trusted-owner')
+            finally:
+                for client in clients:
+                    client.close()
 
     result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Integration))
     del app
@@ -654,13 +843,27 @@ def run_fixture():
             stat = root / 'bin/stat'
             stat.write_text(f'#!{python_bin}\nimport os, sys\ns = os.stat(sys.argv[3])\nprint({{"%s": s.st_size, "%Y": int(s.st_mtime)}}[sys.argv[2]])\n')
             stat.chmod(0o700)
+        appmgr = root / 'bin/lipc-get-prop'
+        appmgr.write_text(f'''#!{python_bin}
+import json, pathlib, sys
+root = pathlib.Path({str(root)!r})
+if (root/'fail-appmgr').exists():
+    print('Synthetic app manager unavailable', file=sys.stderr)
+    raise SystemExit(3)
+if len(sys.argv) != 3 or sys.argv[1] != 'com.lab126.appmgrd':
+    raise SystemExit(2)
+state = root/'foreground.json'
+values = json.loads(state.read_text()) if state.exists() else {{
+    'activeApp': 'com.lab126.booklet.home',
+    'activeContext': 'native-library',
+}}
+print(values[sys.argv[2]])
+''')
+        appmgr.chmod(0o700)
         scanner = root / 'bin/lipc-set-prop'
         scanner.write_text(f'''#!{python_bin}
 import json, pathlib, sys
 root = pathlib.Path({str(root)!r})
-if (root/'fail-scanner').exists():
-    print('Synthetic scanner unavailable', file=sys.stderr)
-    raise SystemExit(1)
 args = sys.argv[1:]
 if args == ['-i', 'com.lab126.scanner', 'doFullScan', '1']:
     action = 'doFullScan'
@@ -672,11 +875,14 @@ else:
     print('Synthetic scanner unexpected invocation:', args, file=sys.stderr)
     raise SystemExit(2)
 
+with (root/'scanner_calls.jsonl').open('a') as output:
+    output.write(json.dumps({{'action': action, 'target': target}})+'\\n')
+if (root/'fail-scanner').exists():
+    print('Synthetic scanner unavailable', file=sys.stderr)
+    raise SystemExit(3)
 files = sorted(str(p.relative_to(root/'documents')) for p in (root/'documents').rglob('*') if p.is_file())
 with (root/'scans.jsonl').open('a') as output:
     output.write(json.dumps(files)+'\\n')
-with (root/'scanner_calls.jsonl').open('a') as output:
-    output.write(json.dumps({{'action': action, 'target': target}})+'\\n')
 ''')
         scanner.chmod(0o700)
         wrapper = root / 'remote-shell'
@@ -687,6 +893,7 @@ if [ -f {root}/fail-commit ]; then
 fi
 PATH={root}/bin:/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
+if [ -z "$SSH_ORIGINAL_COMMAND" ]; then exec /bin/sh -i; fi
 exec /bin/sh -c "$SSH_ORIGINAL_COMMAND"
 ''')
         wrapper.chmod(0o700)
@@ -710,12 +917,19 @@ LogLevel ERROR
             with config.open('a') as stream:
                 stream.write('ListenAddress ::1\n')
         state = root / 'state.json'
-        state.write_text(json.dumps({'fixture': str(root), 'ebook_convert': str(convert), 'ipv6': ipv6, 'options': {
+        state.write_text(json.dumps({'fixture': str(root), 'calibre_debug': str(debug), 'ebook_convert': str(convert), 'ipv6': ipv6, 'options': {
             'host': '127.0.0.1', 'port': port, 'username': getpass.getuser(),
             'identity_file': str(root / 'client_key'), 'known_hosts': str(root / 'known_hosts'),
             'password': '', 'remember_password': False, 'timeout': 5,
         }}))
-        env = {**os.environ, 'CALIBRE_CONFIG_DIRECTORY': str(root / 'calibre-config'), 'QT_QPA_PLATFORM': 'offscreen', STATE_ENV: str(state)}
+        env = {
+            **os.environ, 'CALIBRE_CONFIG_DIRECTORY': str(root / 'calibre-config'),
+            'QT_QPA_PLATFORM': 'offscreen', STATE_ENV: str(state),
+            'TAILCATCTL_RUNTIME_DIR': str(root / 'broker'),
+            'KINDLE_LINK_RUNTIME_DIR': str(root / 'broker'),
+            'TAILCATCTL_CONFIG_DIR': str(root / 'config/tailcat'),
+            'XDG_CONFIG_HOME': str(root / 'config'), 'XDG_CACHE_HOME': str(root / 'cache'),
+        }
         package = build(root / 'KindleSFTP.zip')
         subprocess.run([str(customize), '-a', str(package)], env=env, check=True)
         with (root / 'sshd.log').open('wb') as log:

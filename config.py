@@ -1,18 +1,15 @@
 """Preferences shared by Calibre's device-thread and configuration instances."""
 
-import base64
-import hashlib
 import os
-import posixpath
 import re
-import shutil
-import subprocess
 import threading
-import uuid
 from types import SimpleNamespace
+import uuid
 from typing import Any, Dict, List, Optional
 
 from calibre.utils.config import JSONConfig
+
+from calibre_plugins.kindle_sftp import broker as _broker
 
 FORMATS = ('azw3', 'mobi', 'pdf', 'txt', 'azw', 'prc', 'azw4', 'pobi', 'azw1', 'tpz')
 
@@ -26,206 +23,346 @@ def is_tailcat_address(host: str) -> bool:
 
 
 def format_device_label(dev: Optional[Dict[str, Any]]) -> str:
-    """Format a clean display label for a Kindle device without raw hashes.
-
-    For regular hosts, returns '<alias> (<host>:<port>)' or '<alias> (<host>)'.
-    For Tailcat/Tailscale hosts, returns '<alias> (Tailscale)' without exposing the raw hash.
-    """
+    """Format a clean display label for a Kindle device without raw hashes."""
     if not dev:
         return "Kindle"
     alias = (dev.get("alias") or "Kindle").strip()
     host = (dev.get("host") or "").strip()
     port = dev.get("port", 22)
-
-    if is_tailcat_address(host):
+    if is_tailcat_address(host) or dev.get("endpoint") == "tailcat":
         alias_clean = re.sub(r"\s*\((?:Tailcat|Tailscale)\)\s*$", "", alias, flags=re.IGNORECASE).strip()
         return f"{alias_clean} (Tailscale)" if alias_clean else "Kindle (Tailscale)"
-
     if not host:
         return f"{alias} (no host)"
     return f"{alias} ({host}:{port})" if port != 22 else f"{alias} ({host})"
 
-DEFAULT_DEVICE = {
-    'id': 'default',
-    'alias': 'Kindle',
-    'host': '',
-    'port': 22,
-    'username': 'root',
-    'password': '',
-    'remember_password': False,
-    'identity_file': '',
-    'documents': '/mnt/us/documents',
-    'user_store': '',
-}
 
 DEFAULTS = {
+    # These are Calibre/UI preferences. Endpoint state belongs to kindle-link.
     'enabled': True,
     'auto_connect': True,
-    'devices': [],
-    'active_device_id': '',
-    'known_hosts': '~/.ssh/known_hosts',
-    'timeout': 8,
     'read_metadata': True,
     'format_map': list(FORMATS),
     'save_template': '{author_sort}/{title} - {authors}_{id}',
     'generation': '',
-    # Legacy flat keys retained for direct access / backwards compatibility:
-    'host': '',
-    'port': 22,
-    'username': 'root',
-    'password': '',
-    'remember_password': False,
-    'identity_file': '',
-    'documents': '/mnt/us/documents',
-    'user_store': '',
+    'registry_migrated': False,
 }
 
 prefs = JSONConfig('plugins/kindle_sftp')
 prefs.defaults.update(DEFAULTS)
 _lock = threading.RLock()
 _session_passwords: Dict[str, str] = {}
+_registry_cache: Optional[Dict[str, Any]] = None
+_registry_stamp: Any = None
+
+
+def _legacy_value(name: str, default: Any) -> Any:
+    """Read a pre-registry value without making it part of the new schema."""
+    return prefs.get(name, default)
+
+
+def _legacy_profiles() -> List[Dict[str, Any]]:
+    raw = prefs.get('devices')
+    profiles = [dict(item) for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+    if profiles:
+        return profiles
+    host = str(_legacy_value('host', '') or '').strip()
+    if not host:
+        return []
+    return [{
+        'id': 'default',
+        'alias': 'Kindle',
+        'host': host,
+        'port': _legacy_value('port', 22),
+        'username': _legacy_value('username', 'root'),
+        'password': _legacy_value('password', ''),
+        'remember_password': _legacy_value('remember_password', False),
+        'identity_file': _legacy_value('identity_file', ''),
+        'documents': _legacy_value('documents', '/mnt/us/documents'),
+        'user_store': _legacy_value('user_store', ''),
+    }]
+
+
+def _base_alias(alias: str) -> str:
+    return re.sub(r"\s*\((?:Tailcat|Tailscale)\)\s*$", "", alias or "", flags=re.IGNORECASE).strip() or "Kindle"
+
+
+def _legacy_rows(profiles: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], str, List[tuple]]:
+    """Prepare old rows for Rust's one-time migration logic.
+
+    Pairing and stable device identity are deliberately owned by Rust. Python
+    only removes the old password field and fills endpoint defaults that used
+    to be global preferences.
+    """
+    old_active = str(_legacy_value('active_device_id', '') or '')
+    known_hosts = _legacy_value('known_hosts', '~/.ssh/known_hosts')
+    timeout = _legacy_value('timeout', 8)
+    rows = []
+    passwords = []
+    for profile in profiles:
+        row = dict(profile)
+        password = row.pop('password', '')
+        row.pop('remember_password', None)
+        if 'endpoint' not in row:
+            row['endpoint'] = 'tailcat' if is_tailcat_address(row.get('host')) else 'lan'
+        row['known_hosts'] = profile.get('known_hosts') or known_hosts or '~/.ssh/known_hosts'
+        row['timeout'] = int(profile.get('timeout', timeout) or 8)
+        row['documents'] = profile.get('documents') or '/mnt/us/documents'
+        row['user_store'] = profile.get('user_store') or ''
+        rows.append(row)
+        if password:
+            try:
+                port = int(profile.get('port', 22) or 22)
+            except (TypeError, ValueError):
+                port = 22
+            passwords.append((str(profile.get('host') or '').strip(), port,
+                              str(profile.get('username') or 'root'), str(password),
+                              str(profile.get('alias') or '')))
+    return rows, old_active, passwords
+
+
+def _discard_legacy_values() -> None:
+    for key in (
+        'devices', 'active_device_id', 'host', 'port', 'username', 'password',
+        'remember_password', 'identity_file', 'documents', 'user_store',
+        'known_hosts', 'timeout',
+    ):
+        try:
+            del prefs[key]
+        except (KeyError, TypeError):
+            pass
+
+
+def _cache_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    global _registry_cache, _registry_stamp
+    _registry_cache = {
+        'revision': int(result.get('revision', 0)),
+        'active_id': str(result.get('active_id') or ''),
+        'devices': [dict(row) for row in result.get('devices', []) if isinstance(row, dict)],
+    }
+    _registry_stamp = None
+    return _registry_cache
+
+
+def _frontend() -> Dict[str, Any]:
+    global _registry_cache, _registry_stamp
+    stamp = _broker.registry_stamp()
+    if _registry_cache is None or stamp != _registry_stamp:
+        result = _broker.frontend()
+        if not isinstance(result, dict):
+            raise RuntimeError('kindle-link returned an invalid registry response.')
+        _registry_cache = {
+            'revision': int(result.get('revision', 0)),
+            'active_id': str(result.get('active_id') or ''),
+            'devices': [dict(row) for row in result.get('devices', []) if isinstance(row, dict)],
+        }
+        _registry_stamp = stamp
+    return _registry_cache
+
+
+def _ensure_registry() -> Dict[str, Any]:
+    with _lock:
+        result = _frontend()
+        if prefs.get('registry_migrated', False):
+            return result
+        profiles = _legacy_profiles()
+        if profiles:
+            legacy_rows, old_active, passwords = _legacy_rows(profiles)
+            # A registry may have been populated by the CLI before Calibre's
+            # first launch. Preserve those rows and its active selection.
+            existing = [dict(row) for row in result.get('devices', []) if isinstance(row, dict)]
+            existing_ids = {str(row.get('id') or '') for row in existing if row.get('id')}
+            rows = existing + [row for row in legacy_rows if str(row.get('id') or '') not in existing_ids]
+            active = result.get('active_id') or old_active or ''
+            # Do not remove old values until the registry acknowledges the
+            # complete merged migration. A failed/conflicting save remains
+            # recoverable from the original Calibre preferences.
+            result = _broker.sync_devices(rows, active, revision=int(result.get('revision', 0)))
+            if not isinstance(result, dict):
+                raise RuntimeError('kindle-link returned an invalid migration response.')
+            returned_rows = [row for row in result.get('devices', []) if isinstance(row, dict)]
+            for host, port, username, password, alias in passwords:
+                base_alias = _base_alias(alias)
+                matches = [
+                    row for row in returned_rows
+                    if str(row.get('host') or '').strip() == host
+                    and int(row.get('port', 22) or 22) == port
+                    and str(row.get('username') or 'root') == username
+                    and _base_alias(str(row.get('name') or row.get('alias') or '')) == base_alias
+                ]
+                if not matches:
+                    matches = [
+                        row for row in returned_rows
+                        if str(row.get('host') or '').strip() == host
+                        and int(row.get('port', 22) or 22) == port
+                        and str(row.get('username') or 'root') == username
+                    ]
+                if len(matches) == 1 and matches[0].get('id'):
+                    m_id = str(matches[0]['id'])
+                    _session_passwords[m_id] = password
+                    base_id = str(matches[0].get('device_id') or m_id.split(':')[0])
+                    if base_id:
+                        _session_passwords[base_id] = password
+            _cache_result(result)
+            with prefs:
+                prefs['registry_migrated'] = True
+                prefs['generation'] = str(result.get('revision', ''))
+                _discard_legacy_values()
+            return _registry_cache
+        with prefs:
+            prefs['registry_migrated'] = True
+            _discard_legacy_values()
+        return result
+
+
+def _public_devices(result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    devices = []
+    for row in result.get('devices', []):
+        item = dict(row)
+        endpoint_id = str(item.get('id') or '')
+        base_id = str(item.get('device_id') or endpoint_id.split(':')[0])
+        item['password'] = _session_passwords.get(endpoint_id) or _session_passwords.get(base_id, '')
+        item['remember_password'] = bool(item['password'])
+        if item.get('endpoint') == 'tailcat' or is_tailcat_address(item.get('host', '')):
+            alias = item.get('alias') or 'Kindle'
+            item['alias'] = f"{_base_alias(str(alias))} (Tailscale)"
+        devices.append(item)
+    return devices
 
 
 def get_devices() -> List[Dict[str, Any]]:
-    """Return the list of configured Kindle device profiles."""
+    """Return endpoint rows from the Rust registry."""
     with _lock:
-        raw = prefs.get('devices')
-        if isinstance(raw, list) and raw:
-            result = []
-            for d in raw:
-                d_copy = dict(d)
-                if is_tailcat_address(d_copy.get('host', '')):
-                    alias = d_copy.get('alias', '')
-                    if '(Tailcat)' in alias:
-                        d_copy['alias'] = alias.replace('(Tailcat)', '(Tailscale)')
-                result.append(d_copy)
-            return result
-        # Legacy migration: check if legacy flat host key exists
-        legacy_host = prefs.get('host', '').strip()
-        if legacy_host:
-            legacy = {
-                'id': 'default',
-                'alias': 'Kindle',
-                'host': legacy_host,
-                'port': prefs.get('port', 22),
-                'username': prefs.get('username', 'root'),
-                'documents': prefs.get('documents', '/mnt/us/documents'),
-                'user_store': prefs.get('user_store', ''),
-                'identity_file': prefs.get('identity_file', ''),
-                'password': prefs.get('password', ''),
-                'remember_password': prefs.get('remember_password', False),
-            }
-            return [legacy]
-        return []
+        return _public_devices(_ensure_registry())
 
 
 def get_active_device_id() -> str:
-    """Return the ID of the currently active Kindle profile."""
     with _lock:
-        devs = get_devices()
-        if not devs:
-            return ''
-        active_id = prefs.get('active_device_id')
-        if active_id and any(d.get('id') == active_id for d in devs):
+        result = _ensure_registry()
+        active_id = str(result.get('active_id') or '')
+        if active_id and any(row.get('id') == active_id for row in result.get('devices', [])):
             return active_id
-        return devs[0].get('id', '')
+        rows = result.get('devices', [])
+        return str(rows[0].get('id') or '') if rows else ''
 
 
 def get_active_device() -> Dict[str, Any]:
-    """Return a copy of the active device profile dictionary."""
     with _lock:
-        devs = get_devices()
+        devices = get_devices()
         active_id = get_active_device_id()
-        for d in devs:
-            if d.get('id') == active_id:
-                return dict(d)
-        if devs:
-            return dict(devs[0])
-        # Fallback to legacy keys or empty default
-        return {
-            'id': 'default',
-            'alias': 'Kindle',
-            'host': prefs.get('host', ''),
-            'port': prefs.get('port', 22),
-            'username': prefs.get('username', 'root'),
-            'documents': prefs.get('documents', '/mnt/us/documents'),
-            'user_store': prefs.get('user_store', ''),
-            'identity_file': prefs.get('identity_file', ''),
-            'password': prefs.get('password', ''),
-            'remember_password': prefs.get('remember_password', False),
+        for device in devices:
+            if device.get('id') == active_id:
+                return dict(device)
+        return dict(devices[0]) if devices else {
+            'id': '', 'device_id': '', 'endpoint': 'lan', 'alias': 'Kindle',
+            'host': '', 'port': 22, 'username': 'root', 'identity_file': '',
+            'known_hosts': '~/.ssh/known_hosts', 'timeout': 8,
+            'documents': '/mnt/us/documents', 'user_store': '', 'password': '',
+            'remember_password': False,
         }
 
 
-def set_active_device_id(device_id: str) -> None:
-    """Set the active Kindle device profile ID and bump generation."""
+def registry_revision() -> int:
     with _lock:
-        with prefs:
-            prefs['active_device_id'] = device_id
-            prefs['generation'] = uuid.uuid4().hex
+        return int(_ensure_registry().get('revision', 0))
 
 
-def save_devices(devices: List[Dict[str, Any]], active_id: Optional[str] = None) -> None:
-    """Save the updated list of device profiles and update active device."""
+def set_active_device_id(device_id: str) -> Dict[str, Any]:
     with _lock:
-        with prefs:
-            prefs['devices'] = [dict(d) for d in devices]
-            if active_id:
-                prefs['active_device_id'] = active_id
-            active = get_active_device()
-            # Sync active device properties to legacy flat keys for backward compatibility
-            prefs['host'] = active.get('host', '')
-            prefs['port'] = active.get('port', 22)
-            prefs['username'] = active.get('username', 'root')
-            prefs['documents'] = active.get('documents', '/mnt/us/documents')
-            prefs['user_store'] = active.get('user_store', '')
-            prefs['identity_file'] = active.get('identity_file', '')
-            prefs['password'] = active.get('password', '') if active.get('remember_password') else ''
-            prefs['remember_password'] = active.get('remember_password', False)
-            prefs['generation'] = uuid.uuid4().hex
+        result = _broker.select_device(str(device_id))
+        if not isinstance(result, dict):
+            raise RuntimeError('kindle-link returned an invalid selection response.')
+        return _cache_result(result)
+
+
+def _registry_row(device: Dict[str, Any]) -> Dict[str, Any]:
+    row = dict(device)
+    row.pop('password', None)
+    row.pop('remember_password', None)
+    row.pop('_legacy_password', None)
+    row.setdefault('endpoint', 'tailcat' if is_tailcat_address(row.get('host', '')) else 'lan')
+    row.setdefault('device_id', str(row.get('id', '')).rsplit(':', 1)[0])
+    row.setdefault('id', f"{row['device_id']}:{row['endpoint']}")
+    row.setdefault('alias', 'Kindle')
+    row.setdefault('port', 22)
+    row.setdefault('username', 'root')
+    row.setdefault('identity_file', '')
+    row.setdefault('known_hosts', '~/.ssh/known_hosts')
+    row.setdefault('timeout', 8)
+    row.setdefault('documents', '/mnt/us/documents')
+    row.setdefault('user_store', '')
+    return row
+
+
+def save_devices(devices: List[Dict[str, Any]], active_id: Optional[str] = None,
+                 revision: Optional[int] = None) -> Dict[str, Any]:
+    """Atomically replace registry endpoint rows, optionally using CAS revision."""
+    with _lock:
+        public = [dict(device) for device in devices]
+        for device in public:
+            validate_device(device)
+        rows = [_registry_row(device) for device in public]
+        if active_id is None:
+            active_id = get_active_device_id()
+        result = _broker.sync_devices(rows, active_id or '', revision=revision)
+        if not isinstance(result, dict):
+            raise RuntimeError('kindle-link returned an invalid save response.')
+        # Password changes become session state only after a successful save.
+        new_ids = set()
+        for device in public:
+            endpoint_id = str(device.get('id') or '')
+            base_id = str(device.get('device_id') or endpoint_id.split(':')[0])
+            new_ids.add(endpoint_id)
+            if base_id:
+                new_ids.add(base_id)
+            if device.get('password'):
+                _session_passwords[endpoint_id] = str(device['password'])
+                if base_id:
+                    _session_passwords[base_id] = str(device['password'])
+            elif 'password' in device and device.get('password') == '':
+                _session_passwords.pop(endpoint_id, None)
+                if base_id:
+                    _session_passwords.pop(base_id, None)
+        for endpoint_id in list(_session_passwords):
+            if endpoint_id not in new_ids:
+                _session_passwords.pop(endpoint_id, None)
+        _cache_result(result)
+        return result
 
 
 def set_device_enabled(enabled: bool) -> None:
-    """Enable or disable device connection."""
     with _lock:
         with prefs:
-            prefs['enabled'] = enabled
-            prefs['generation'] = uuid.uuid4().hex
+            prefs['enabled'] = bool(enabled)
+            prefs['generation'] = str(uuid.uuid4().hex)
 
 
 def connection_options() -> Dict[str, Any]:
-    """Construct options dictionary for SSHTransport and device driver."""
+    """Construct options from the active Rust endpoint and UI preferences."""
     with _lock:
         dev = get_active_device()
-        dev_id = dev.get('id', 'default')
-
-        # Read host and port from active device, falling back to legacy flat keys
-        host = dev.get('host') or prefs.get('host', '')
-        port = dev.get('port') or prefs.get('port', 22)
-        username = dev.get('username') or prefs.get('username', 'root')
-        documents = dev.get('documents') or prefs.get('documents', '/mnt/us/documents')
-        user_store = dev.get('user_store') or prefs.get('user_store', '')
-        identity_file = dev.get('identity_file') or prefs.get('identity_file', '')
-        remember = dev.get('remember_password', False)
-        pwd = dev.get('password', '') if remember else _session_passwords.get(dev_id, prefs.get('password', ''))
-
+        dev_id = dev.get('id', '')
+        base_id = dev.get('device_id', '') or dev_id.split(':')[0]
+        password = _session_passwords.get(dev_id) or _session_passwords.get(base_id, '')
         result = {
             'enabled': prefs.get('enabled', True),
             'auto_connect': prefs.get('auto_connect', prefs.get('enabled', True)),
-            'host': host,
-            'port': port,
-            'username': username,
-            'documents': documents,
-            'user_store': user_store,
-            'identity_file': os.path.expanduser(identity_file),
-            'known_hosts': os.path.expanduser(prefs.get('known_hosts', '~/.ssh/known_hosts')),
-            'password': pwd,
-            'remember_password': remember,
-            'timeout': prefs.get('timeout', 8),
+            'host': dev.get('host', ''),
+            'port': dev.get('port', 22),
+            'username': dev.get('username', 'root'),
+            'documents': dev.get('documents', '/mnt/us/documents'),
+            'user_store': dev.get('user_store', ''),
+            'identity_file': os.path.expanduser(dev.get('identity_file') or ''),
+            'known_hosts': os.path.expanduser(dev.get('known_hosts') or '~/.ssh/known_hosts'),
+            'password': password,
+            'remember_password': bool(password),
+            'timeout': int(dev.get('timeout', 8) or 8),
             'read_metadata': prefs.get('read_metadata', True),
             'format_map': list(prefs.get('format_map', FORMATS)),
             'save_template': prefs.get('save_template', '{author_sort}/{title} - {authors}_{id}'),
             'generation': prefs.get('generation', ''),
-            'device_id': dev_id,
+            'device_id': dev.get('device_id') or dev_id,
+            'endpoint_id': dev_id,
             'device_alias': dev.get('alias', 'Kindle'),
         }
         return result
@@ -244,7 +381,7 @@ def device_settings() -> SimpleNamespace:
 
 
 def validate_device(dev: Dict[str, Any]) -> None:
-    """Validate a single device configuration."""
+    """Validate a single endpoint configuration."""
     host = dev.get('host', '').strip()
     username = dev.get('username', '').strip()
     if host.startswith('-') or any(c.isspace() or ord(c) < 32 for c in host):
@@ -292,19 +429,25 @@ def validate_options(options: Dict[str, Any], dev: Optional[Dict[str, Any]] = No
 
 
 def store_options(options: Dict[str, Any], dev: Optional[Dict[str, Any]] = None) -> None:
-    """Store global preferences and active device settings."""
+    """Store UI preferences and update the active endpoint in the Rust registry."""
+    if dev is None:
+        dev = get_active_device()
     validate_options(options, dev=dev)
     with _lock:
+        if dev.get('id'):
+            updated = dict(dev)
+            updated['known_hosts'] = options.get('known_hosts', '~/.ssh/known_hosts')
+            updated['timeout'] = int(options.get('timeout', 8))
+            save_devices([updated if row.get('id') == dev.get('id') else row
+                          for row in get_devices()], get_active_device_id(),
+                         revision=registry_revision())
         with prefs:
             prefs['enabled'] = options.get('enabled', True)
             prefs['auto_connect'] = options.get('auto_connect', True)
-            prefs['timeout'] = options.get('timeout', 8)
-            prefs['known_hosts'] = options.get('known_hosts', '~/.ssh/known_hosts')
             prefs['read_metadata'] = options.get('read_metadata', True)
             prefs['format_map'] = options.get('format_map', list(FORMATS))
             prefs['save_template'] = options.get('save_template', '{author_sort}/{title} - {authors}_{id}')
-            prefs['generation'] = uuid.uuid4().hex
-
+            prefs['generation'] = str(registry_revision())
 
 class ConfigWidget:
     """Factory kept lazy so loading a device driver never initializes Qt."""

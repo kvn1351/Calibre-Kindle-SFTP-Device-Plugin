@@ -3,11 +3,9 @@
 from functools import partial
 import os
 import re
-import shutil
-import subprocess
-import tempfile
+import shlex
 import uuid
-
+from typing import Optional
 from qt.core import (
     QAction, QActionGroup, QApplication, QCheckBox, QComboBox, QDialog,
     QDialogButtonBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
@@ -16,19 +14,15 @@ from qt.core import (
     QThread, QTimer, QToolButton, QVBoxLayout, QWidget, pyqtSignal,
 )
 
-from calibre.gui2 import error_dialog, info_dialog
+from calibre.gui2 import Dispatcher, error_dialog, info_dialog
 from calibre.gui2.actions import InterfaceAction
 
 from calibre_plugins.kindle_sftp.config import (
     format_device_label, get_active_device, get_active_device_id, get_devices,
-    prefs, save_devices, set_active_device_id, set_device_enabled,
-    validate_device,
+    registry_revision, save_devices, set_active_device_id, validate_device,
 )
-from calibre_plugins.kindle_sftp.transport import (
-    SSHTransport, deploy_tailcat, download_tailcat_binary, find_host_tailcat,
-    get_bundled_tailcat_arm_path, get_kindle_architecture,
-    is_tailcat_address, probe_host,
-)
+from calibre_plugins.kindle_sftp.broker import executable, get_host_keys, setup_tailcat
+from calibre_plugins.kindle_sftp.transport import SSHTransport, is_tailcat_address
 
 
 class ManageConnectionsDialog(QDialog):
@@ -41,15 +35,19 @@ class ManageConnectionsDialog(QDialog):
         self.resize(760, 520)
 
         raw_devices = get_devices()
-        # Deep-copy devices list to isolate dialog edits
+        # Deep-copy devices and retain the registry revision for optimistic CAS.
         self.devices = [dict(d) for d in raw_devices]
         self.active_id = initial_device_id or get_active_device_id()
+        self.revision = registry_revision()
         self._updating_form = False
 
         if not self.devices:
-            # Create a blank first device if none exist
+            # A blank draft is not persisted until the user accepts the dialog.
+            device_id = uuid.uuid4().hex
             first = {
-                "id": uuid.uuid4().hex,
+                "id": f"{device_id}:lan",
+                "device_id": device_id,
+                "endpoint": "lan",
                 "alias": "My Kindle",
                 "host": "",
                 "port": 22,
@@ -57,6 +55,8 @@ class ManageConnectionsDialog(QDialog):
                 "password": "",
                 "remember_password": False,
                 "identity_file": "",
+                "known_hosts": "~/.ssh/known_hosts",
+                "timeout": 8,
                 "documents": "/mnt/us/documents",
                 "user_store": "",
             }
@@ -133,7 +133,9 @@ class ManageConnectionsDialog(QDialog):
         self.edit_password.textEdited.connect(self._on_field_edited)
         form.addRow("SSH Password:", self.edit_password)
 
-        self.chk_remember_password = QCheckBox("Save password in Calibre preferences (plaintext)")
+        self.chk_remember_password = QCheckBox(
+            "Keep password in memory for this Calibre session (never save to disk)"
+        )
         self.chk_remember_password.toggled.connect(self._on_field_edited)
         form.addRow(self.chk_remember_password)
 
@@ -217,7 +219,7 @@ class ManageConnectionsDialog(QDialog):
             self.chk_remember_password.setChecked(bool(dev.get("remember_password", False)))
             self.edit_identity.setText(dev.get("identity_file", ""))
             host = dev.get("host", "").strip()
-            is_tc = is_tailcat_address(host)
+            is_tc = dev.get("endpoint") == "tailcat" or is_tailcat_address(host)
             self.btn_tailcat.setVisible(not is_tc)
             self.btn_tailcat_help.setVisible(not is_tc)
         finally:
@@ -237,11 +239,12 @@ class ManageConnectionsDialog(QDialog):
         dev["remember_password"] = self.chk_remember_password.isChecked()
         dev["identity_file"] = self.edit_identity.text().strip()
         dev["documents"] = dev.get("documents") or "/mnt/us/documents"
-        is_tc = is_tailcat_address(dev["host"])
+        dev.setdefault("known_hosts", "~/.ssh/known_hosts")
+        dev.setdefault("timeout", 8)
+        is_tc = dev.get("endpoint") == "tailcat" or is_tailcat_address(dev["host"])
         self.btn_tailcat.setVisible(not is_tc)
         self.btn_tailcat_help.setVisible(not is_tc)
 
-        # Update item label in list without triggering full reload
         row = self.list_widget.currentRow()
         item = self.list_widget.item(row)
         if item is not None:
@@ -249,8 +252,11 @@ class ManageConnectionsDialog(QDialog):
             item.setText(f"{active_marker}{format_device_label(dev)}")
 
     def _add_device(self):
+        device_id = uuid.uuid4().hex
         new_dev = {
-            "id": uuid.uuid4().hex,
+            "id": f"{device_id}:lan",
+            "device_id": device_id,
+            "endpoint": "lan",
             "alias": f"Kindle {len(self.devices) + 1}",
             "host": "",
             "port": 22,
@@ -258,6 +264,8 @@ class ManageConnectionsDialog(QDialog):
             "password": "",
             "remember_password": False,
             "identity_file": "",
+            "known_hosts": "~/.ssh/known_hosts",
+            "timeout": 8,
             "documents": "/mnt/us/documents",
             "user_store": "",
         }
@@ -320,8 +328,8 @@ class ManageConnectionsDialog(QDialog):
                 "password": dev["password"],
                 "identity_file": dev["identity_file"],
                 "documents": dev["documents"],
-                "known_hosts": os.path.expanduser(prefs.get("known_hosts", "~/.ssh/known_hosts")),
-                "timeout": prefs.get("timeout", 8),
+                "known_hosts": os.path.expanduser(dev.get("known_hosts") or "~/.ssh/known_hosts"),
+                "timeout": int(dev.get("timeout", 8) or 8),
             }
             transport = SSHTransport(opts)
             try:
@@ -351,63 +359,18 @@ class ManageConnectionsDialog(QDialog):
             port = int(dev.get("port", 22))
             if not host:
                 raise ValueError("Enter the Kindle hostname or IP address first (e.g. 192.168.1.50).")
-            timeout = prefs.get("timeout", 8)
-            keys, fingerprints = [], []
-            if is_tailcat_address(host):
-                tailcat_bin = find_host_tailcat()
-                if not tailcat_bin:
-                    raise ValueError("The 'tailcat' binary was not found on your system. Please install tailcat first.")
-                with tempfile.NamedTemporaryFile(delete=False) as tf:
-                    temp_kh = tf.name
-                try:
-                    cmd = [
-                        shutil.which("ssh") or "ssh",
-                        "-F", "/dev/null",
-                        "-o", "StrictHostKeyChecking=accept-new",
-                        "-o", f"UserKnownHostsFile={temp_kh}",
-                        "-o", "GlobalKnownHostsFile=/dev/null",
-                        "-o", f"ProxyCommand='{tailcat_bin}' '{host}' '{port}'",
-                        "-o", "BatchMode=yes",
-                        "-o", f"ConnectTimeout={timeout}",
-                        "-p", str(port),
-                        f"probe@{host}",
-                        "true",
-                    ]
-                    subprocess.run(cmd, capture_output=True, timeout=timeout + 5, check=False)
-                    with open(temp_kh, "r", encoding="utf-8", errors="replace") as f:
-                        raw_lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-                finally:
-                    if os.path.exists(temp_kh):
-                        try:
-                            os.remove(temp_kh)
-                        except OSError:
-                            pass
-                for line in raw_lines:
-                    parts = line.split()
-                    if len(parts) >= 3:
-                        digest = hashlib.sha256(base64.b64decode(parts[2], validate=True)).digest()
-                        fingerprints.append(parts[1] + " SHA256:" + base64.b64encode(digest).decode().rstrip("="))
-                        tc_prefix = f"{host.lower()},{host}"
-                        keys.append(f"{tc_prefix} {parts[1]} {parts[2]}")
-            else:
-                executable = shutil.which("ssh-keyscan")
-                if not executable:
-                    raise ValueError("OpenSSH ssh-keyscan is not installed or not on PATH.")
-                result = subprocess.run(
-                    [executable, "-T", str(timeout), "-p", str(port), host],
-                    capture_output=True, timeout=timeout + 5, check=False,
-                )
-                for line in result.stdout.decode("utf-8").splitlines():
-                    parts = line.split()
-                    if len(parts) != 3 or line.startswith("#"):
-                        continue
-                    digest = hashlib.sha256(base64.b64decode(parts[2], validate=True)).digest()
-                    fingerprints.append(parts[1] + " SHA256:" + base64.b64encode(digest).decode().rstrip("="))
-                    keys.append(line)
+            timeout = int(dev.get("timeout", 8) or 8)
+            keys = get_host_keys({**dev, 'timeout': timeout})
+            fingerprints = []
+            for line in keys:
+                parts = line.split()
+                if len(parts) != 3:
+                    raise ValueError("kindle-link returned a malformed SSH host key.")
+                digest = hashlib.sha256(base64.b64decode(parts[2], validate=True)).digest()
+                fingerprints.append(parts[1] + " SHA256:" + base64.b64encode(digest).decode().rstrip("="))
             if not keys:
-                raise ValueError("No SSH host keys were returned. Check the hostname, port, and server.\n"
-                                 + result.stderr.decode("utf-8", "replace"))
-            known_hosts_path = os.path.abspath(os.path.expanduser(prefs.get("known_hosts", "~/.ssh/known_hosts")))
+                raise ValueError("No SSH host keys were returned. Check the hostname, port, and server.")
+            known_hosts_path = os.path.abspath(os.path.expanduser(dev.get("known_hosts") or "~/.ssh/known_hosts"))
             message = (
                 f"The server at {host}:{port} supplied:\n\n"
                 + "\n".join(fingerprints)
@@ -446,7 +409,8 @@ class ManageConnectionsDialog(QDialog):
     def _show_tailcat_info(self):
         curr_dev = self._current_device()
         host = curr_dev.get("host", "") if curr_dev else ""
-        dlg = TailcatInfoDialog(self, host=host)
+        device_id = curr_dev.get("device_id", "") if curr_dev else ""
+        dlg = TailcatInfoDialog(self, host=host, device_id=device_id)
         dlg.exec()
 
     def _save_and_accept(self):
@@ -455,10 +419,11 @@ class ManageConnectionsDialog(QDialog):
                 validate_device(dev)
             if not self.active_id and self.devices:
                 self.active_id = self.devices[0].get("id", "")
-            save_devices(self.devices, self.active_id)
+            save_devices(self.devices, self.active_id, revision=self.revision)
             self.accept()
         except Exception as error:
-            error_dialog(self, "Invalid Device Configuration", str(error), show=True)
+            title = "Connection Save Conflict" if "revision" in str(error).lower() or "conflict" in str(error).lower() else "Invalid Device Configuration"
+            error_dialog(self, title, str(error), show=True)
 
 
 class DeployTailcatWorker(QThread):
@@ -475,7 +440,7 @@ class DeployTailcatWorker(QThread):
 
     def run(self):
         try:
-            tc_addr = deploy_tailcat(
+            tc_addr = setup_tailcat(
                 self.dev_opts,
                 binary_path=self.bin_path,
                 arch=self.arch,
@@ -490,17 +455,7 @@ class DeployTailcatWorker(QThread):
 class TailcatInfoDialog(QDialog):
     """Modal dialog explaining how Tailcat works, files installed on Kindle, and uninstallation."""
 
-    UNINSTALL_CMD = (
-        'killall tailcat 2>/dev/null; '
-        'rm -rf /mnt/us/tailcat '
-        '/mnt/us/documents/"Calibre Start Tailcat.sh" '
-        '/mnt/us/documents/"Calibre Stop Tailcat.sh" '
-        '/mnt/us/documents/"Start Tailcat.sh" '
-        '/mnt/us/documents/"Stop Tailcat.sh" '
-        '/mnt/us/extensions/tailcat'
-    )
-
-    def __init__(self, parent=None, host=""):
+    def __init__(self, parent=None, host="", device_id=""):
         super().__init__(parent)
         self.setWindowTitle("About Tailcat Remote Access")
         self.setWindowIcon(QIcon.ic("devices/kindle.png"))
@@ -511,17 +466,29 @@ class TailcatInfoDialog(QDialog):
         browser = QTextBrowser(self)
         browser.setOpenExternalLinks(True)
 
-        target_host = host if (host and not is_tailcat_address(host)) else "192.168.1.50"
-        self.ssh_cmd = f"ssh root@{target_host} '{self.UNINSTALL_CMD}'"
+        stable_id = device_id
+        if not stable_id and host:
+            try:
+                matches = [row for row in get_devices()
+                           if row.get("endpoint") == "tailcat" and row.get("host") == host]
+            except Exception:
+                matches = []
+            if len(matches) == 1:
+                stable_id = matches[0].get("device_id", "")
+        try:
+            binary = executable()
+        except Exception:
+            binary = "kindle-link"
+        self.uninstall_cmd = shlex.join([binary, "uninstall", "--device", stable_id or "DEVICE_ID"])
 
         html = f"""
         <h2>Tailcat Remote Access</h2>
         <p><b>Tailcat</b> (<code>tailscale/tailcat</code>) provides secure, encrypted point-to-point connections over Tailscale's global WireGuard data plane and NAT-traversal relays (DERP), <b>without requiring a Tailscale account, central coordination server, or open firewall ports</b>.</p>
-        <p>When running the setup wizard, Calibre downloads the official static Linux release directly from Tailscale's GitHub repository on demand, keeping this plugin small, secure, and transparent.</p>
+        <p>The kindle-link broker owns provisioning and records the resulting endpoint in its device registry. It obtains the official static Linux release on demand, keeping this plugin small and transparent.</p>
 
         <h3>How it Works</h3>
         <ul>
-            <li>Your Kindle generates a permanent, private ed25519 node key stored exclusively on the device (<code>kindle.private.json</code>).</li>
+            <li>Your Kindle generates a permanent, private WireGuard Curve25519 node key stored exclusively on the device (<code>kindle.private.json</code>).</li>
             <li>From this key, Tailcat derives a unique, permanent address (e.g. <code>tcpGFw...</code>).</li>
             <li>When you activate Tailcat on the Kindle, it listens and forwards encrypted traffic to the local Dropbear SSH server (port 22).</li>
             <li>Calibre connects to that address through OpenSSH's <code>ProxyCommand</code>, providing seamless wireless book sync from anywhere outside your home network.</li>
@@ -542,28 +509,19 @@ class TailcatInfoDialog(QDialog):
         </ul>
 
         <h3>Full Uninstallation</h3>
-        <p>Because everything is confined to user storage, removing Tailcat is 100% clean and immediate.</p>
-        <p><b>Method 1 — Over SSH (Terminal, PowerShell, or Command Prompt):</b></p>
-        <p>Run the uninstallation command over your local network from your computer (e.g. Linux shell, macOS Terminal, or Windows PowerShell / Command Prompt):</p>
-        <pre style="background: #2b2b2b; color: #f0f0f0; padding: 10px; border-radius: 4px; font-family: monospace; white-space: pre-wrap; word-break: break-all;">{self.ssh_cmd}</pre>
-        <p><i>(Replace <code>{target_host}</code> with your Kindle's local Wi-Fi IP address if different, e.g. <code>192.168.1.50</code>, <code>192.168.0.50</code>, or <code>10.0.0.50</code>)</i></p>
-
-        <p><b>Method 2 — Via USB Cable (File Explorer / Finder / Linux File Manager):</b></p>
-        <ol>
-            <li>Connect your Kindle to your computer using a USB cable.</li>
-            <li>Open the mounted <b>Kindle</b> drive in your file manager (File Explorer on Windows, Finder on macOS, or your desktop file manager on Linux).</li>
-            <li>Delete the <code>tailcat</code> folder.</li>
-            <li>Inside the <code>documents</code> folder, delete <code>Calibre Start Tailcat.sh</code> and <code>Calibre Stop Tailcat.sh</code>.</li>
-            <li>Inside the <code>extensions</code> folder, delete the <code>tailcat</code> folder (if present).</li>
-            <li>Safely eject the Kindle drive before disconnecting the USB cable (on macOS, empty Trash before ejecting to free disk space).</li>
-        </ol>
+        <p>The kindle-link CLI owns Tailcat removal and removes the registry endpoint after a successful device operation.</p>
+        <p><b>Method 1 — Run the broker command:</b></p>
+        <p>Copy and run this command on the computer where Calibre and kindle-link are installed:</p>
+        <pre style="background: #2b2b2b; color: #f0f0f0; padding: 10px; border-radius: 4px; font-family: monospace; white-space: pre-wrap; word-break: break-all;">{self.uninstall_cmd}</pre>
+        <p>The command contains the stable registry device ID; it does not guess a LAN address or execute an SSH shell pipeline.</p>
+        <p>Do not delete individual files while Tailcat is running. The broker command performs the device cleanup and registry update as one operation.</p>
         """
         browser.setHtml(html)
         layout.addWidget(browser)
 
         btn_box = QHBoxLayout()
         btn_copy = QPushButton("Copy Uninstall Command")
-        btn_copy.setToolTip("Copy the SSH uninstallation command to clipboard")
+        btn_copy.setToolTip("Copy the kindle-link CLI uninstallation command to clipboard")
         btn_copy.clicked.connect(self._copy_uninstall)
         btn_box.addWidget(btn_copy)
         btn_box.addStretch(1)
@@ -574,7 +532,7 @@ class TailcatInfoDialog(QDialog):
         layout.addLayout(btn_box)
 
     def _copy_uninstall(self):
-        QApplication.clipboard().setText(self.ssh_cmd)
+        QApplication.clipboard().setText(self.uninstall_cmd)
         info_dialog(self, "Copied to Clipboard", "The uninstallation command has been copied to your clipboard.", show=True)
 
 
@@ -593,8 +551,8 @@ class TailcatSetupWizardDialog(QDialog):
 
         header = QLabel(
             "<h3>Tailcat Remote Access Setup</h3>"
-            "<p>Deploy Tailcat (<code>tailscale/tailcat</code>) to your Kindle user storage "
-            "(<code>/mnt/us/tailcat/</code>) to enable secure remote access outside your home Wi-Fi.<br>"
+            "<p>The kindle-link broker provisions Tailcat to your Kindle user storage "
+            "(<code>/mnt/us/tailcat/</code>) and records the remote endpoint in its registry.<br>"
             "<b>No root filesystem modifications or boot daemons are installed.</b> Tailcat runs "
             "on-demand via scriptlets when you activate it on the Kindle.</p>"
         )
@@ -680,7 +638,8 @@ class TailcatSetupWizardDialog(QDialog):
 
     def _show_tailcat_info(self):
         host = self.device.get("host", "") if getattr(self, "device", None) else ""
-        dlg = TailcatInfoDialog(self, host=host)
+        device_id = self.device.get("device_id", "") if getattr(self, "device", None) else ""
+        dlg = TailcatInfoDialog(self, host=host, device_id=device_id)
         dlg.exec()
 
     def _browse_binary(self):
@@ -720,8 +679,8 @@ class TailcatSetupWizardDialog(QDialog):
 
         force_key = self.chk_force_key.isChecked()
         dev_opts = dict(self.device)
-        dev_opts["known_hosts"] = os.path.expanduser(prefs.get("known_hosts", "~/.ssh/known_hosts"))
-        dev_opts["timeout"] = prefs.get("timeout", 10)
+        dev_opts["known_hosts"] = os.path.expanduser(dev_opts.get("known_hosts") or "~/.ssh/known_hosts")
+        dev_opts["timeout"] = int(dev_opts.get("timeout", 10) or 10)
 
         self.worker = DeployTailcatWorker(dev_opts, bin_path, arch, force_key)
         self.worker.log_msg.connect(self._append_log)
@@ -737,33 +696,39 @@ class TailcatSetupWizardDialog(QDialog):
         orig_alias = self.device.get("alias") or "Kindle"
         base_alias = re.sub(r"\s*\((?:Tailcat|Tailscale)\)\s*$", "", orig_alias, flags=re.IGNORECASE).strip() or "Kindle"
         new_alias = f"{base_alias} (Tailscale)"
-        new_dev = dict(self.device)
-        new_dev["id"] = uuid.uuid4().hex
-        new_dev["alias"] = new_alias
-        new_dev["host"] = tc_addr
-        new_dev["port"] = 22
-
-        existing_idx = None
-        for idx, d in enumerate(parent.devices):
-            if d.get("host") == tc_addr or d.get("alias") in (new_alias, f"{base_alias} (Tailcat)"):
-                existing_idx = idx
-                break
-
-        if existing_idx is not None:
-            parent.devices[existing_idx]["alias"] = new_alias
-            parent.devices[existing_idx]["host"] = tc_addr
-            parent.devices[existing_idx]["port"] = 22
-            parent.active_id = parent.devices[existing_idx]["id"]
-            parent._refresh_list_widget()
-            parent.list_widget.setCurrentRow(existing_idx)
+        # setup_tailcat persists the endpoint in the Rust registry. Reload that
+        # row instead of inventing a second ID in the dialog draft.
+        registry_devices = get_devices()
+        remote = next(
+            (row for row in registry_devices
+             if row.get("endpoint") == "tailcat"
+             and (row.get("host") == tc_addr or row.get("device_id") == self.device.get("device_id"))),
+            None,
+        )
+        if remote is None:
+            error_dialog(
+                self, "Tailcat Setup Incomplete",
+                "Tailcat reported success, but kindle-link did not return the saved remote endpoint.",
+                show=True,
+            )
+            return
+        remote["alias"] = new_alias
+        existing_idx = next(
+            (idx for idx, row in enumerate(parent.devices)
+             if row.get("id") == remote.get("id")
+             or (row.get("device_id") == remote.get("device_id") and row.get("endpoint") == "tailcat")),
+            None,
+        )
+        if existing_idx is None:
+            parent.devices.append(dict(remote))
+            existing_idx = len(parent.devices) - 1
         else:
-            parent.devices.append(new_dev)
-            parent.active_id = new_dev["id"]
-            parent._refresh_list_widget()
-            for idx, d in enumerate(parent.devices):
-                if d.get("id") == new_dev["id"]:
-                    parent.list_widget.setCurrentRow(idx)
-                    break
+            # Keep unsaved edits to every other draft row intact.
+            parent.devices[existing_idx] = dict(remote)
+        parent.active_id = remote.get("id", "")
+        parent.revision = registry_revision()
+        parent._refresh_list_widget()
+        parent.list_widget.setCurrentRow(existing_idx)
 
         msg = (
             f"Tailcat has been successfully configured on your Kindle!\n\n"
@@ -801,6 +766,7 @@ class KindleSFTPAction(InterfaceAction):
     def genesis(self):
         if not hasattr(self, 'qaction') or self.qaction is None:
             self.create_action()
+        self._refresh_pending = False
         self.qaction.setIcon(QIcon.ic("devices/kindle.png"))
         self.qaction.triggered.connect(self.toggle_connection)
         self.menu = self.qaction.menu()
@@ -853,6 +819,7 @@ class KindleSFTPAction(InterfaceAction):
                 self.qaction.setToolTip(f"Connect to {info} over Wi-Fi")
             else:
                 self.qaction.setToolTip("Configure and link Kindle over Wi-Fi")
+        self.refresh_action.setEnabled(connected and not self._refresh_pending)
 
     def toggle_connection(self):
         if self.is_kindle_connected():
@@ -943,8 +910,58 @@ class KindleSFTPAction(InterfaceAction):
 
         # 2. Main menu separator and entries
         self.menu.addSeparator()
+        self.refresh_action = self.menu.addAction(
+            QIcon.ic("view-refresh.png"), "Full refresh Kindle library",
+        )
+        self.refresh_action.setEnabled(self.is_kindle_connected() and not self._refresh_pending)
+        self.refresh_action.triggered.connect(self.request_full_refresh)
         pref_act = self.menu.addAction(QIcon.ic("config.png"), "Preferences…")
         pref_act.triggered.connect(self.open_preferences)
+
+    def request_full_refresh(self):
+        if not self.is_kindle_connected() or self._refresh_pending:
+            return
+        dm = self.gui.device_manager
+        self._refresh_pending = True
+        self.update_button_state()
+        try:
+            dm.create_job(
+                partial(self._run_full_refresh, dm.device),
+                Dispatcher(self._full_refresh_done),
+                "Full refresh Kindle library",
+            )
+        except Exception:
+            self._refresh_pending = False
+            self.update_button_state()
+            raise
+        self.show_status_message("Requesting a full native Kindle library refresh…", 5000)
+
+    def _run_full_refresh(self, device):
+        if not self.is_kindle_connected() or self.gui.device_manager.device is not device:
+            raise RuntimeError("The Kindle connection changed before the refresh could start.")
+        return device.refresh_library()
+
+    def _full_refresh_done(self, job):
+        self._refresh_pending = False
+        self.update_button_state()
+        if job.failed:
+            error_dialog(
+                self.gui, "Kindle library refresh failed",
+                "Return to the native Kindle library and check that its stock scanner is running. "
+                "No book files were changed by this refresh request.",
+                det_msg=job.details, show=True,
+            )
+        elif not job.result:
+            info_dialog(
+                self.gui, "Kindle library refresh skipped",
+                "KOReader is active. Return to the native Kindle library, then choose "
+                "Full refresh Kindle library again.",
+                show=True,
+            )
+        else:
+            self.show_status_message(
+                "Full native Kindle library refresh requested; indexing runs asynchronously.", 8000,
+            )
 
     def open_manage_connections(self):
         dlg = ManageConnectionsDialog(self.gui)
