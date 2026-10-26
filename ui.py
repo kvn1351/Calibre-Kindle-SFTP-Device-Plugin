@@ -134,7 +134,11 @@ class ManageConnectionsDialog(QDialog):
         form.addRow("SSH Password:", self.edit_password)
 
         self.chk_remember_password = QCheckBox(
-            "Keep password in memory for this Calibre session (never save to disk)"
+            "Save password on this computer (stored in Calibre preferences)"
+        )
+        self.chk_remember_password.setToolTip(
+            "If checked, the SSH password is saved in Calibre's preferences on this computer.\n"
+            "If unchecked, the password is only held in memory for this Calibre session and never written to disk."
         )
         self.chk_remember_password.toggled.connect(self._on_field_edited)
         form.addRow(self.chk_remember_password)

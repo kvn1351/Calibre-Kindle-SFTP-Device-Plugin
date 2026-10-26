@@ -46,6 +46,7 @@ DEFAULTS = {
     'save_template': '{author_sort}/{title} - {authors}_{id}',
     'generation': '',
     'registry_migrated': False,
+    'device_passwords': {},
 }
 
 prefs = JSONConfig('plugins/kindle_sftp')
@@ -217,12 +218,16 @@ def _ensure_registry() -> Dict[str, Any]:
 
 def _public_devices(result: Dict[str, Any]) -> List[Dict[str, Any]]:
     devices = []
+    saved_passwords = prefs.get('device_passwords') or {}
     for row in result.get('devices', []):
         item = dict(row)
         endpoint_id = str(item.get('id') or '')
         base_id = str(item.get('device_id') or endpoint_id.split(':')[0])
-        item['password'] = _session_passwords.get(endpoint_id) or _session_passwords.get(base_id, '')
-        item['remember_password'] = bool(item['password'])
+        pw = _session_passwords.get(endpoint_id) or _session_passwords.get(base_id)
+        if pw is None:
+            pw = saved_passwords.get(endpoint_id) or saved_passwords.get(base_id, '')
+        item['password'] = pw or ''
+        item['remember_password'] = bool(saved_passwords.get(endpoint_id) or saved_passwords.get(base_id))
         item.setdefault('documents', '/mnt/us/documents')
         item.setdefault('user_store', '')
         if item.get('endpoint') == 'tailcat' or is_tailcat_address(item.get('host', '')):
@@ -312,25 +317,43 @@ def save_devices(devices: List[Dict[str, Any]], active_id: Optional[str] = None,
         result = _broker.sync_devices(rows, active_id or '', revision=revision)
         if not isinstance(result, dict):
             raise RuntimeError('kindle-link returned an invalid save response.')
-        # Password changes become session state only after a successful save.
+        # Password changes become session state and optionally persistent preferences.
         new_ids = set()
-        for device in public:
-            endpoint_id = str(device.get('id') or '')
-            base_id = str(device.get('device_id') or endpoint_id.split(':')[0])
-            new_ids.add(endpoint_id)
-            if base_id:
-                new_ids.add(base_id)
-            if device.get('password'):
-                _session_passwords[endpoint_id] = str(device['password'])
+        with prefs:
+            saved = dict(prefs.get('device_passwords') or {})
+            for device in public:
+                endpoint_id = str(device.get('id') or '')
+                base_id = str(device.get('device_id') or endpoint_id.split(':')[0])
+                new_ids.add(endpoint_id)
                 if base_id:
-                    _session_passwords[base_id] = str(device['password'])
-            elif 'password' in device and device.get('password') == '':
-                _session_passwords.pop(endpoint_id, None)
-                if base_id:
-                    _session_passwords.pop(base_id, None)
-        for endpoint_id in list(_session_passwords):
-            if endpoint_id not in new_ids:
-                _session_passwords.pop(endpoint_id, None)
+                    new_ids.add(base_id)
+                if device.get('password'):
+                    pw = str(device['password'])
+                    _session_passwords[endpoint_id] = pw
+                    if base_id:
+                        _session_passwords[base_id] = pw
+                    if device.get('remember_password'):
+                        saved[endpoint_id] = pw
+                        if base_id:
+                            saved[base_id] = pw
+                    else:
+                        saved.pop(endpoint_id, None)
+                        if base_id:
+                            saved.pop(base_id, None)
+                elif 'password' in device and device.get('password') == '':
+                    _session_passwords.pop(endpoint_id, None)
+                    if base_id:
+                        _session_passwords.pop(base_id, None)
+                    saved.pop(endpoint_id, None)
+                    if base_id:
+                        saved.pop(base_id, None)
+            for endpoint_id in list(_session_passwords):
+                if endpoint_id not in new_ids:
+                    _session_passwords.pop(endpoint_id, None)
+            for eid in list(saved):
+                if eid not in new_ids:
+                    saved.pop(eid, None)
+            prefs['device_passwords'] = saved
         _cache_result(result)
         return result
 
@@ -348,7 +371,11 @@ def connection_options() -> Dict[str, Any]:
         dev = get_active_device()
         dev_id = dev.get('id', '')
         base_id = dev.get('device_id', '') or dev_id.split(':')[0]
-        password = _session_passwords.get(dev_id) or _session_passwords.get(base_id, '')
+        saved_passwords = prefs.get('device_passwords') or {}
+        password = (_session_passwords.get(dev_id)
+                    or _session_passwords.get(base_id)
+                    or saved_passwords.get(dev_id)
+                    or saved_passwords.get(base_id, ''))
         result = {
             'enabled': prefs.get('enabled', True),
             'auto_connect': prefs.get('auto_connect', prefs.get('enabled', True)),
