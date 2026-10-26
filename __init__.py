@@ -273,6 +273,70 @@ class KindleSFTP(DevicePlugin, InterfaceActionBase):
             _, free = self._connection().space()
             return (free, -1, -1)
 
+    def put_file(self, infile, path, replace_file=False, end_session=True):
+        import shutil, tempfile
+        with self._lock:
+            close = False
+            if hasattr(infile, 'name') and os.path.isfile(str(infile.name)):
+                source = infile.name
+            elif hasattr(infile, 'read'):
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.bin')
+                shutil.copyfileobj(infile, tmp)
+                tmp.close()
+                source = tmp.name
+                close = True
+            elif isinstance(infile, str) and os.path.isfile(infile):
+                source = infile
+            else:
+                raise ValueError('infile must be a valid file or path')
+
+            try:
+                clean = path.strip('/')
+                if clean.startswith('documents/'):
+                    clean = clean[len('documents/'):]
+                elif clean == 'documents' or not clean:
+                    clean = os.path.basename(source)
+                dest = posixpath.normpath(posixpath.join(self._root, clean))
+                if not dest.startswith(self._root + '/'):
+                    dest = posixpath.join(self._root, os.path.basename(source))
+
+                self._connection().upload(source, dest)
+                self._refresh_library(paths=[dest])
+            finally:
+                if close:
+                    try:
+                        os.unlink(source)
+                    except OSError:
+                        pass
+
+    def get_file(self, path, outfile, end_session=True):
+        with self._lock:
+            clean = path.strip('/')
+            if clean.startswith('documents/'):
+                clean = clean[len('documents/'):]
+            target = posixpath.normpath(posixpath.join(self._root, clean))
+            data = self._connection().read_bytes(target)
+            outfile.write(data)
+
+    def list(self, path, recurse=False):
+        with self._lock:
+            import time
+            from types import SimpleNamespace
+            files = []
+            now = time.time()
+            for item in self._connection().list_books():
+                fname = posixpath.basename(item['path'])
+                files.append(SimpleNamespace(
+                    name=fname,
+                    path=item['path'],
+                    is_dir=False,
+                    is_readonly=False,
+                    size=item.get('size', 0),
+                    ctime=now,
+                    wtime=now,
+                ))
+            return [(path, files)]
+
     def _relative_path(self, path):
         if not isinstance(path, str) or not path.startswith(self._root + '/'):
             raise ValueError('Book path is outside the configured Kindle documents directory.')
