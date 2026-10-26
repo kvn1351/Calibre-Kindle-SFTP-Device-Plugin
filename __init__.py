@@ -132,7 +132,7 @@ class KindleSFTP(DevicePlugin, InterfaceActionBase):
             was_open = self._open
             self._close_transport()
             self._options = options
-            self._root = posixpath.normpath(options['documents'])
+            self._root = posixpath.normpath(options.get('documents') or '/mnt/us/documents')
             self._ejected = False
             self._open = False
             self._must_disconnect = self._must_disconnect or was_open
@@ -209,8 +209,8 @@ class KindleSFTP(DevicePlugin, InterfaceActionBase):
 
     def debug_managed_device_detection(self, devices_on_system, output):
         options = connection_options()
-        print(f'Kindle SFTP: enabled={options["enabled"]}; host={options["host"]!r}; '
-              f'port={options["port"]}; documents={options["documents"]!r}', file=output)
+        print(f'Kindle SFTP: enabled={options.get("enabled", True)}; host={options.get("host", "")!r}; '
+              f'port={options.get("port", 22)}; documents={options.get("documents", "/mnt/us/documents")!r}', file=output)
         if not options['enabled'] or not options['host']:
             print('Configure and enable Kindle SFTP in Preferences → Plugins → Device interface.', file=output)
             return False

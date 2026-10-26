@@ -241,6 +241,10 @@ class ManageConnectionsDialog(QDialog):
         dev["documents"] = dev.get("documents") or "/mnt/us/documents"
         dev.setdefault("known_hosts", "~/.ssh/known_hosts")
         dev.setdefault("timeout", 8)
+        if is_tailcat_address(dev["host"]):
+            dev["endpoint"] = "tailcat"
+        elif not dev.get("endpoint") or dev.get("endpoint") == "tailcat":
+            dev["endpoint"] = "lan"
         is_tc = dev.get("endpoint") == "tailcat" or is_tailcat_address(dev["host"])
         self.btn_tailcat.setVisible(not is_tc)
         self.btn_tailcat_help.setVisible(not is_tc)
@@ -322,12 +326,13 @@ class ManageConnectionsDialog(QDialog):
             if not dev.get("host"):
                 raise ValueError("Enter the Kindle hostname or IP address first.")
             opts = {
-                "host": dev["host"],
-                "port": dev["port"],
-                "username": dev["username"],
-                "password": dev["password"],
-                "identity_file": dev["identity_file"],
-                "documents": dev["documents"],
+                "host": dev.get("host", "").strip(),
+                "port": int(dev.get("port", 22) or 22),
+                "username": dev.get("username", "root") or "root",
+                "password": dev.get("password", ""),
+                "identity_file": dev.get("identity_file", ""),
+                "documents": dev.get("documents") or "/mnt/us/documents",
+                "user_store": dev.get("user_store", ""),
                 "known_hosts": os.path.expanduser(dev.get("known_hosts") or "~/.ssh/known_hosts"),
                 "timeout": int(dev.get("timeout", 8) or 8),
             }

@@ -223,6 +223,8 @@ def _public_devices(result: Dict[str, Any]) -> List[Dict[str, Any]]:
         base_id = str(item.get('device_id') or endpoint_id.split(':')[0])
         item['password'] = _session_passwords.get(endpoint_id) or _session_passwords.get(base_id, '')
         item['remember_password'] = bool(item['password'])
+        item.setdefault('documents', '/mnt/us/documents')
+        item.setdefault('user_store', '')
         if item.get('endpoint') == 'tailcat' or is_tailcat_address(item.get('host', '')):
             alias = item.get('alias') or 'Kindle'
             item['alias'] = f"{_base_alias(str(alias))} (Tailscale)"
@@ -280,7 +282,10 @@ def _registry_row(device: Dict[str, Any]) -> Dict[str, Any]:
     row.pop('password', None)
     row.pop('remember_password', None)
     row.pop('_legacy_password', None)
-    row.setdefault('endpoint', 'tailcat' if is_tailcat_address(row.get('host', '')) else 'lan')
+    if is_tailcat_address(row.get('host', '')):
+        row['endpoint'] = 'tailcat'
+    else:
+        row.setdefault('endpoint', 'lan')
     row.setdefault('device_id', str(row.get('id', '')).rsplit(':', 1)[0])
     row.setdefault('id', f"{row['device_id']}:{row['endpoint']}")
     row.setdefault('alias', 'Kindle')
