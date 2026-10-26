@@ -53,7 +53,7 @@ def client_tests():
                 prefs['read_metadata'] = True
                 prefs['generation'] = uuid.uuid4().hex
             row = {**self.options, 'id': 'fixture:lan', 'device_id': 'fixture',
-                   'endpoint': 'lan', 'alias': 'Fixture Kindle'}
+                   'endpoint': 'lan', 'alias': 'FixtureKindle'}
             save_devices([row], active_id=row['id'])
             self.plugin = type(template)(template.plugin_path)
             self.plugin.startup()
@@ -444,7 +444,7 @@ def client_tests():
             from calibre_plugins.kindle_sftp.ui import KindleSFTPAction, ManageConnectionsDialog
             rows = get_devices()
             other = {**rows[0], 'id': 'second:lan', 'device_id': 'second',
-                     'alias': 'Second Kindle', 'host': '192.0.2.2', 'password': 'memory-only-secret'}
+                     'alias': 'SecondKindle', 'host': '192.0.2.2', 'password': 'memory-only-secret'}
             rows.append(other)
             save_devices(rows, active_id='fixture:lan')
             devices = json.loads(subprocess.check_output([executable(), 'devices', '--json']))['devices']
@@ -467,11 +467,11 @@ def client_tests():
                 self.assertEqual(frontend(), before, 'Cancel persisted draft edits')
                 # A CLI update must not be overwritten by a dialog's stale snapshot.
                 newer = frontend()
-                newer['devices'][0]['alias'] = 'Renamed through CLI'
+                newer['devices'][0]['alias'] = 'RenamedCLI'
                 sync_devices(newer['devices'], newer['active_id'], newer['revision'])
                 with self.assertRaises(RuntimeError):
                     save_devices(dialog.devices, dialog.active_id, revision=dialog.revision)
-                self.assertEqual(get_devices()[0]['alias'], 'Renamed through CLI')
+                self.assertEqual(get_devices()[0]['alias'], 'RenamedCLI')
             finally:
                 dialog.close()
                 dialog.deleteLater()
@@ -482,7 +482,7 @@ def client_tests():
                 action.interface_action_base_plugin = self.plugin
                 action.do_genesis()
                 selection = next(a.menu() for a in action.menu.actions() if a.menu())
-                first = next(a for a in selection.actions() if 'Renamed through CLI' in a.text())
+                first = next(a for a in selection.actions() if 'RenamedCLI' in a.text())
                 first.trigger()
                 self.assertEqual(get_active_device_id(), 'fixture:lan')
                 self.assertEqual(frontend()['active_id'], 'fixture:lan')
@@ -510,9 +510,9 @@ def client_tests():
         def test_existing_calibre_profiles_migrate_without_losing_cli_devices(self):
             from calibre_plugins.kindle_sftp.config import get_active_device_id
             address = 'tcLegacy_Profile-Address0123456789'
-            lan = {**self.options, 'id': 'old-local', 'alias': 'Legacy Reader',
+            lan = {**self.options, 'id': 'old-local', 'alias': 'LegacyReader',
                    'password': 'legacy-secret', 'remember_password': True}
-            remote = {**lan, 'id': 'old-remote', 'alias': 'Legacy Reader (Tailscale)',
+            remote = {**lan, 'id': 'old-remote', 'alias': 'LegacyReader-Tailscale',
                       'host': address, 'port': 22}
             with prefs:
                 prefs['registry_migrated'] = False
@@ -520,7 +520,7 @@ def client_tests():
                 prefs['active_device_id'] = 'old-remote'
             rows = get_devices()
             self.assertIn('fixture:lan', [row['id'] for row in rows])
-            migrated = [row for row in rows if row['alias'].startswith('Legacy Reader')]
+            migrated = [row for row in rows if row['alias'].startswith('LegacyReader')]
             self.assertEqual({row['endpoint'] for row in migrated}, {'lan', 'tailcat'})
             self.assertEqual(len({row['device_id'] for row in migrated}), 1)
             self.assertEqual({row['password'] for row in migrated}, {'legacy-secret'})

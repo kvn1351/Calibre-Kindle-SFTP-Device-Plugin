@@ -48,7 +48,7 @@ class ManageConnectionsDialog(QDialog):
                 "id": f"{device_id}:lan",
                 "device_id": device_id,
                 "endpoint": "lan",
-                "alias": "My Kindle",
+                "alias": "MyKindle",
                 "host": "",
                 "port": 22,
                 "username": "root",
@@ -106,7 +106,7 @@ class ManageConnectionsDialog(QDialog):
         right_layout.addLayout(form)
 
         self.edit_alias = QLineEdit()
-        self.edit_alias.setPlaceholderText("e.g. Paperwhite 5, Oasis")
+        self.edit_alias.setPlaceholderText("e.g. Paperwhite5, Oasis (no spaces)")
         self.edit_alias.textEdited.connect(self._on_field_edited)
         form.addRow("Device Alias:", self.edit_alias)
 
@@ -271,7 +271,7 @@ class ManageConnectionsDialog(QDialog):
             "id": f"{device_id}:lan",
             "device_id": device_id,
             "endpoint": "lan",
-            "alias": f"Kindle {len(self.devices) + 1}",
+            "alias": f"Kindle_{len(self.devices) + 1}",
             "host": "",
             "port": 22,
             "username": "root",
@@ -709,8 +709,9 @@ class TailcatSetupWizardDialog(QDialog):
 
         parent = self.parent()
         orig_alias = self.device.get("alias") or "Kindle"
-        base_alias = re.sub(r"\s*\((?:Tailcat|Tailscale)\)\s*$", "", orig_alias, flags=re.IGNORECASE).strip() or "Kindle"
-        new_alias = f"{base_alias} (Tailscale)"
+        base_alias = re.sub(r"[\s_-]*\((?:Tailcat|Tailscale)\)\s*$", "", orig_alias, flags=re.IGNORECASE)
+        base_alias = re.sub(r"[-_](?:Tailcat|Tailscale)$", "", base_alias, flags=re.IGNORECASE).strip() or "Kindle"
+        new_alias = f"{base_alias}-Tailscale"
         # setup_tailcat persists the endpoint in the Rust registry. Reload that
         # row instead of inventing a second ID in the dialog draft.
         registry_devices = get_devices()

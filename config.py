@@ -420,6 +420,9 @@ def device_settings() -> SimpleNamespace:
 
 def validate_device(dev: Dict[str, Any]) -> None:
     """Validate a single endpoint configuration."""
+    alias = dev.get('alias', '').strip()
+    if alias and any(c.isspace() or ord(c) < 32 for c in alias):
+        raise ValueError('Device name / alias cannot contain spaces or whitespace. Use hyphens or underscores instead (e.g. "Kindle-PW5").')
     host = dev.get('host', '').strip()
     username = dev.get('username', '').strip()
     if host.startswith('-') or any(c.isspace() or ord(c) < 32 for c in host):
